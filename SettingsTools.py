@@ -1,3 +1,5 @@
+from .MaterialCards import MaterialCards
+from .MaterialKnowledge import MaterialKnowledge
 from .GeometryChecks import snapshot_geometry, analyse_geometry, snapshot_gcode, analyse_gcode
 
 import math
@@ -47,6 +49,8 @@ class SettingsTools:
     def __init__(self):
         self._slice_monitor = SliceMonitor()
         self._materials = MaterialTools()
+        self._knowledge = MaterialKnowledge()
+        self._cards = MaterialCards()
         self._search_cache = {}
 
     def on_main_thread(self, function, cancel_event=None, deadline=None):
@@ -524,6 +528,9 @@ class SettingsTools:
         ]
 
         definitions.extend([
+            ("get_material_info", "Полная компактная карточка точной марки: все свойства, печать и сушка за один вызов. Без material — текущий материал. Сравнивает настройки только если карточка однозначно соответствует текущей марке; ничего не меняет.", {"material": {"type": "string"}}, []),
+            ("search_material_knowledge", "Поиск локального справочника по точной марке (например PC G20) или свойству. Возвращает ID, не свойства. Для чтения вызови get_material_knowledge. Пустой запрос показывает каталог.", {"query": {"type": "string", "maxLength": 300}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, []),
+            ("get_material_knowledge", "Прочитать части документа из локального справочника. next_offset означает продолжение. Не переносить свойства на другие марки. requires_review означает непроверенное извлечение PDF.", {"document_id": {"type": "string"}, "query": {"type": "string", "maxLength": 300, "description": "Фильтр по разделу или слову: температура, печати, свойства. Пустой — все части."}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 3}}, ["document_id"]),
             ("validate_geometry", "Проверить сетки активного стола и параметры 5D. Частичная проверка: обязательно сообщи not_checked, не объявляй готовность к печати.", {}, []),
             ("validate_toolpaths", "Частичный анализ имеющегося G-code: команды движения и диапазоны записанных координат. Не симуляция столкновений. Сообщи not_checked.", {}, []),
             ("list_materials", "Список существующих профилей для текущего принтера и активного экструдера. Поиск по названию/типу/бренду, например ASA. Возвращает идентификаторы и описание, если оно есть. Это не проверка свойств по ТЗ.",
@@ -559,7 +566,18 @@ class SettingsTools:
             snapshot, analyse = (snapshot_geometry, analyse_geometry) if name == "validate_geometry" else (snapshot_gcode, analyse_gcode)
             data = self.on_main_thread(snapshot, cancel_event, deadline)
             return analyse(data, cancel_event, deadline)
+        if name in ("search_material_knowledge", "get_material_knowledge"):
+            keys = {"query", "offset", "limit"} if name == "search_material_knowledge" else {"document_id", "offset", "limit", "query"}
+            if not isinstance(arguments, dict) or set(arguments) - keys:
+                raise ValueError("Неверные аргументы справочника.")
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Запрос отменён.")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RuntimeError("Истёк лимит задачи.")
+            function = self._knowledge.search if name == "search_material_knowledge" else self._knowledge.read
+            return function(**arguments)
         allowed = {
+            "get_material_info": (self.get_material_info, {"material"}),
             "list_materials": (self._materials.list_materials, {"query", "offset", "limit"}),
             "set_material": (self._materials.set_material, {"material_id", "extruder_id", "printer_id"}),
             "list_print_settings": (
@@ -611,7 +629,12 @@ class SettingsTools:
             meta["editable"] = self._editable(key, meta)
             meta["enabled"] = bool(stack.getProperty(key, "enabled"))
             settings.append(meta)
-        return {"context": self.get_print_context(), "settings": settings}
+        result = {"context": self.get_print_context(), "settings": settings}
+        try:
+            result["material_info"] = self.get_material_info()
+        except Exception as exc:
+            result["material_info"] = {"found": False, "error": str(exc)}
+        return result
 
     def get_print_context(self):
         global_stack, extruder = self._stacks()
@@ -643,3 +666,25 @@ class SettingsTools:
 
     def cancel_slicing(self):
         return self.on_main_thread(self._slice_monitor.cancel)
+
+    def get_material_info(self, material=None):
+        global_stack, extruder = self._stacks()
+        active = extruder if extruder is not None else global_stack
+        container = getattr(active, "material", None)
+        current_name = container.getName() if container is not None else ""
+        card = self._cards.get(material or current_name)
+        card["current_material"] = current_name
+        current_card = self._cards.get(current_name) if current_name else {"found": False}
+        if card.get("found") and current_card.get("id") == card.get("id"):
+            values = {}
+            for key in self._cards.KEYS:
+                try:
+                    values.update(self.read([key]))
+                except Exception:
+                    values[key] = None
+            card["current_settings"] = values
+            card["comparison"] = self._cards.compare(card, values)
+        else:
+            card["comparison"] = []
+            card["comparison_note"] = "Текущий материал не совпал однозначно с карточкой; сравнение пропущено."
+        return card
