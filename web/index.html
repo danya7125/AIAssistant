@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AI Assistant — STE Slicer</title>
+
+    <style>
+        /* Основной вид страницы */
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: #eef3f9;
+            color: #182739;
+            font: 16px system-ui, sans-serif;
+        }
+
+        main {
+            max-width: 740px;
+            margin: 32px auto;
+            padding: 24px;
+            background: white;
+            border-radius: 16px;
+        }
+
+        h1 {
+            margin-top: 0;
+        }
+
+        p {
+            color: #53647b;
+        }
+
+        /* История переписки */
+        #messages {
+            height: 360px;
+            overflow: auto;
+            margin-bottom: 16px;
+            padding: 12px;
+            border: 1px solid #ccd6e4;
+            border-radius: 8px;
+        }
+
+        .message {
+            margin-bottom: 10px;
+            padding: 12px;
+            background: #edf2f8;
+            border-radius: 8px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
+        .user {
+            background: #ddebff;
+        }
+
+        .error {
+            background: #ffe9e9;
+        }
+
+        /* Форма отправки сообщения */
+        form {
+            display: flex;
+            gap: 8px;
+        }
+
+        textarea {
+            flex: 1;
+            min-width: 0;
+            padding: 12px;
+            border: 1px solid #aab9cb;
+            border-radius: 8px;
+            font: inherit;
+        }
+
+        button {
+            padding: 12px;
+            border: 0;
+            border-radius: 8px;
+            background: #1764d8;
+            color: white;
+            font: inherit;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: wait;
+        }
+
+        #status {
+            font-size: 14px;
+        }
+
+        @media (max-width: 520px) {
+            main {
+                margin: 12px;
+                padding: 16px;
+            }
+
+            form {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>AI Assistant</h1>
+        <p>Помощник по STE Slicer и 3D/5D-печати.</p>
+
+        <div id="messages" role="log" aria-live="polite"></div>
+
+        <form id="chat">
+            <textarea
+                id="text"
+                rows="2"
+                aria-label="Сообщение"
+                placeholder="Напиши сообщение…"
+                required
+            ></textarea>
+            <button id="send" type="submit">Отправить</button>
+        </form>
+
+        <p id="status" role="status">
+            Enter — отправить · Shift+Enter — новая строка
+        </p>
+    </main>
+
+    <script>
+        'use strict';
+
+        const chatForm = document.getElementById('chat');
+        const messageInput = document.getElementById('text');
+        const sendButton = document.getElementById('send');
+        const messageList = document.getElementById('messages');
+        const statusText = document.getElementById('status');
+
+        const REQUEST_TIMEOUT_MS = 75000;
+        let isSending = false;
+
+        // Показываем текст безопасно: HTML из ответа не выполняется.
+        function addMessage(author, text, type) {
+            const messageElement = document.createElement('div');
+            messageElement.className = 'message ' + type;
+            messageElement.textContent = author + '\n' + text;
+
+            messageList.appendChild(messageElement);
+            messageList.scrollTop = messageList.scrollHeight;
+        }
+
+        async function sendMessage(event) {
+            event.preventDefault();
+
+            const messageText = messageInput.value.trim();
+            if (!messageText || isSending) {
+                return;
+            }
+
+            isSending = true;
+            sendButton.disabled = true;
+            addMessage('Вы', messageText, 'user');
+            messageInput.value = '';
+            statusText.textContent = 'Ожидаем ответ…';
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(function () {
+                controller.abort();
+            }, REQUEST_TIMEOUT_MS);
+
+            try {
+                // Python-плагин принимает сообщение и обращается к LLM.
+                const response = await fetch('/api/message', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ text: messageText }),
+                    signal: controller.signal
+                });
+
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+
+                const data = await response.json();
+                if (typeof data.reply !== 'string') {
+                    throw new Error('В ответе нет поля reply');
+                }
+
+                addMessage('Помощник', data.reply, 'assistant');
+                statusText.textContent = 'Ответ получен.';
+            } catch (error) {
+                const errorText = error.name === 'AbortError'
+                    ? 'Сервер не ответил за ' + REQUEST_TIMEOUT_MS / 1000 + ' секунд.'
+                    : error.message;
+
+                addMessage('Ошибка', errorText, 'error');
+                statusText.textContent =
+                    'Проверь, что слайсер открыт. Открывай чат через меню плагина.';
+
+                // Возвращаем неотправленный текст, не стирая новый черновик.
+                if (!messageInput.value) {
+                    messageInput.value = messageText;
+                }
+            } finally {
+                clearTimeout(timeoutId);
+                isSending = false;
+                sendButton.disabled = false;
+                messageInput.focus();
+            }
+        }
+
+        chatForm.addEventListener('submit', sendMessage);
+
+        // Enter отправляет сообщение, Shift+Enter добавляет новую строку.
+        messageInput.addEventListener('keydown', function (event) {
+            if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+                event.preventDefault();
+                chatForm.requestSubmit();
+            }
+        });
+
+        messageInput.focus();
+    </script>
+</body>
+</html>
