@@ -1,3 +1,4 @@
+import ssl
 import json
 import os
 import threading
@@ -214,7 +215,13 @@ class AIAssistant(Extension):
             )
 
             try:
-                with urlopen(request, timeout=60) as response:
+                ca_file = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "cacert.pem"
+                )
+                # Проверяем сертификат сервера по доверенному набору Mozilla.
+                context = ssl.create_default_context(cafile=ca_file)
+                with urlopen(request, timeout=60, context=context) as response:
                     result = json.loads(
                         response.read().decode("utf-8")
                     )
