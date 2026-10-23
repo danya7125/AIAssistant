@@ -47,6 +47,7 @@ class ChatWindow(QDialog):
 
         self._assistant = assistant
         self._busy = False
+        self._cancel_event = threading.Event()
 
         # Настройки окна
         self.setWindowTitle(
@@ -96,6 +97,11 @@ class ChatWindow(QDialog):
         )
 
         buttons.addWidget(settings)
+        self.cancel_button = QPushButton("Отменить")
+        self.cancel_button.setAutoDefault(False)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_request)
+        buttons.addWidget(self.cancel_button)
         buttons.addStretch()
 
         self.send_button = QPushButton(
@@ -163,6 +169,14 @@ class ChatWindow(QDialog):
         if not text or self._busy:
             return
 
+        if len(text) > 24000:
+            self.status.setText("Сократите сообщение до 24000 символов.")
+            return
+        self._cancel_event = threading.Event()
+        cancel_event = self._cancel_event
+        request_text = text
+        self.cancel_button.setEnabled(True)
+
         # Блокируем повторную отправку
         self._busy = True
 
@@ -197,9 +211,10 @@ class ChatWindow(QDialog):
 
             try:
                 reply = self._assistant.ask_llm(
-                    text,
+                    request_text,
                     print_settings=settings,
-                    progress=self._bridge.tool_event.emit
+                    progress=self._bridge.tool_event.emit,
+                    cancel_event=cancel_event
                 )
 
                 # Уведомление, если настройки
@@ -229,6 +244,9 @@ class ChatWindow(QDialog):
         worker.start()
 
     def show_tool_event(self, event):
+        if event.get("phase") == "status":
+            self.status.setText(event.get("message", ""))
+            return
         name = event.get("name", "")
         if event.get("phase") == "start":
             self.status.setText("Выполняется инструмент: " + name)
@@ -238,7 +256,7 @@ class ChatWindow(QDialog):
         output = event.get("output", {})
         if not output.get("ok"):
             self.append_message("Ошибка инструмента", output.get("error", "Неизвестная ошибка"))
-        elif name == "set_print_settings":
+        elif name in ("set_print_settings", "set_material"):
             changes = output.get("result", {}).get("changes", [])
             text = "\n".join("{0}: {1} → {2}".format(c["key"], c["before"], c["after"])
                              for c in changes)
@@ -256,6 +274,7 @@ class ChatWindow(QDialog):
         )
 
         self._busy = False
+        self.cancel_button.setEnabled(False)
 
         self.send_button.setEnabled(True)
 
@@ -264,6 +283,11 @@ class ChatWindow(QDialog):
         )
 
         self.input.setFocus()
+
+    def cancel_request(self):
+        self._cancel_event.set()
+        self.cancel_button.setEnabled(False)
+        self.status.setText("Останавливаем запрос. Уже применённые настройки сохраняются.")
 
     # Обработка закрытия окна
     def closeEvent(self, event):

@@ -282,7 +282,7 @@ class AIAssistant(Extension):
         window.input.setFocus()
 
     # Отправка запроса к нейросети
-    def ask_llm(self, text, print_settings=None, progress=None):
+    def ask_llm(self, text, print_settings=None, progress=None, cancel_event=None, task_text=None):
         config = self._config.copy()
         if not all(config.values()):
             return "Откройте AI Assistant → Settings и заполните URL, ключ и модель."
@@ -293,7 +293,7 @@ class AIAssistant(Extension):
         try:
             reply = self._agent.run(
                 config, text, self._history,
-                print_settings=print_settings, progress=progress
+                print_settings=print_settings, progress=progress, cancel_event=cancel_event, task_text=task_text
             )
             self._history.extend([
                 {"role": "user", "content": text},

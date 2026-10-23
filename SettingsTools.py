@@ -1,6 +1,9 @@
 
 import math
 import threading
+import time
+from .SliceMonitor import SliceMonitor
+from .MaterialTools import MaterialTools
 
 from PyQt5.QtCore import QThread
 from UM.Application import Application
@@ -41,10 +44,16 @@ class SettingsTools:
     PRINTING_MODES = ("classic", "cylindrical", "cylindrical_full")
 
     def __init__(self):
-        pass
+        self._slice_monitor = SliceMonitor()
+        self._materials = MaterialTools()
+        self._search_cache = {}
 
-    def on_main_thread(self, function):
+    def on_main_thread(self, function, cancel_event=None, deadline=None):
         app = Application.getInstance()
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Запрос отменён.")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RuntimeError("Истёк общий срок задачи.")
 
         if QThread.currentThread() == app.thread():
             return function()
@@ -55,16 +64,21 @@ class SettingsTools:
 
         def execute():
             with guard:
-                if not state["cancelled"]:
+                if (not state["cancelled"]
+                        and not (cancel_event is not None and cancel_event.is_set())
+                        and not (deadline is not None and time.monotonic() >= deadline)):
                     try:
                         state["result"] = function()
                     except Exception as error:
                         state["error"] = error
+                else:
+                    state["error"] = RuntimeError("Запрос отменён или срок задачи истёк.")
                 done.set()
 
         app.callLater(execute)
 
-        if not done.wait(30):
+        wait_seconds = min(30, max(0, deadline - time.monotonic())) if deadline else 30
+        if not done.wait(wait_seconds):
             with guard:
                 if not done.is_set():
                     state["cancelled"] = True
@@ -225,14 +239,16 @@ class SettingsTools:
         found = []
 
         for key in sorted(global_stack.getAllKeys()):
-            stack = self._stack(key, stacks)
-            meta = self._metadata(key, stack)
-
-            searchable = " ".join([
-                key,
-                meta["label"],
-                meta["description"]
-            ]).lower()
+            # Only static search text is cached; values/bounds remain live.
+            cache_key = (global_stack.getId(), key)
+            searchable = self._search_cache.get(cache_key)
+            if searchable is None:
+                stack = self._stack(key, stacks)
+                searchable = " ".join([
+                    key, str(stack.getProperty(key, "label") or ""),
+                    str(stack.getProperty(key, "description") or "")
+                ]).lower()
+                self._search_cache[cache_key] = searchable
 
             if search in searchable:
                 found.append(key)
@@ -506,6 +522,14 @@ class SettingsTools:
             )
         ]
 
+        definitions.extend([
+            ("list_materials", "Список существующих профилей для текущего принтера и активного экструдера. Поиск по названию/типу/бренду, например ASA. Возвращает идентификаторы и описание, если оно есть. Это не проверка свойств по ТЗ.",
+             {"query": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, []),
+            ("set_material", "Выбрать профиль из list_materials по явной команде пользователя. Передай все три ID из списка. Прочитай настройки заново после переключения; при requires_user_action остановись.",
+             {"material_id": {"type": "string"}, "extruder_id": {"type": "string"}, "printer_id": {"type": "string"}}, ["material_id", "extruder_id", "printer_id"]),
+            ("get_slicing_status", "Проверить фактическое завершение нарезки и наличие G-code. completed не означает сохранение файла.", {}, []),
+            ("get_print_context", "Текущий принтер, материал, профиль и размеры загруженных моделей. Не подтверждает физические характеристики материала.", {}, [])
+        ])
         result = []
 
         for name, description, properties, required in definitions:
@@ -525,8 +549,10 @@ class SettingsTools:
 
         return result
 
-    def call(self, name, arguments):
+    def call(self, name, arguments, cancel_event=None, deadline=None):
         allowed = {
+            "list_materials": (self._materials.list_materials, {"query", "offset", "limit"}),
+            "set_material": (self._materials.set_material, {"material_id", "extruder_id", "printer_id"}),
             "list_print_settings": (
                 self.describe,
                 {"query", "offset", "limit"}
@@ -539,10 +565,9 @@ class SettingsTools:
                 self.write,
                 {"values"}
             ),
-            "start_slicing": (
-                self.start_slicing,
-                set()
-            )
+            "start_slicing": (self.start_slicing, set()),
+            "get_slicing_status": (self.get_slicing_status, set()),
+            "get_print_context": (self.get_print_context, set())
         }
 
         if name not in allowed or not isinstance(arguments, dict):
@@ -558,24 +583,54 @@ class SettingsTools:
             )
 
         return self.on_main_thread(
-            lambda: function(**arguments)
+            lambda: function(**arguments), cancel_event, deadline
         )
 
-    def start_slicing(self):
-        """Запуск процесса нарезки модели (слайсинга) в слайсере."""
+    def initial_context(self):
+        """One Qt dispatch supplies context and exact primary setting metadata."""
+        global_stack, extruder = self._stacks()
+        stacks = (global_stack, extruder)
+        settings = []
+        available = global_stack.getAllKeys()
+        for key in self.MAIN_SETTINGS:
+            if key not in available:
+                continue
+            stack = self._stack(key, stacks)
+            meta = self._metadata(key, stack)
+            meta.pop("description", None)
+            meta["value"] = self.read([key])[key]
+            meta["editable"] = self._editable(key, meta)
+            meta["enabled"] = bool(stack.getProperty(key, "enabled"))
+            settings.append(meta)
+        return {"context": self.get_print_context(), "settings": settings}
+
+    def get_print_context(self):
+        global_stack, extruder = self._stacks()
+        active = extruder if extruder is not None else global_stack
+        def container_name(attribute):
+            container = getattr(active, attribute, None)
+            return container.getName() if container is not None else None
         app = Application.getInstance()
-        
-        try:
-            from UM.SliceEngine import SliceEngine
-            SliceEngine.getInstance().startSlicing()
-            return {"status": "success", "message": "Процесс нарезки успешно запущен."}
-        except Exception:
-            pass
+        scene = app.getController().getScene()
+        models = []
+        for node in scene.getRoot().getAllChildren():
+            if node.getMeshData() is None or not node.callDecoration("isSliceable"):
+                continue
+            box = node.getBoundingBox()
+            models.append({"name": node.getName(),
+                           "size_mm": {"x": float(box.width), "y": float(box.height), "z": float(box.depth)},
+                           "build_plate": node.callDecoration("getBuildPlateNumber")})
+        return {"printer": global_stack.getName(), "material": container_name("material"),
+                "profile": container_name("quality"), "models": models,
+                "notes": "Название материала не подтверждает его свойства. Tg, прочность и химстойкость нужны из документации производителя. Размеры модели не заменяют расчёт прочности."}
 
-        # Запасной вариант через обновление сцены принтера
-        controller = app.getController()
-        if controller and hasattr(controller, "getScene"):
-            # Триггерим пересчет сцены, если прямой вызов движка недоступен
-            pass
+    def start_slicing(self):
+        self._stacks()
+        return self._slice_monitor.start()
 
-        return {"status": "success", "message": "Команда нарезки отправлена."}
+    def get_slicing_status(self):
+        self._stacks()
+        return self._slice_monitor.status()
+
+    def cancel_slicing(self):
+        return self.on_main_thread(self._slice_monitor.cancel)
