@@ -1,3 +1,4 @@
+from .GeometryChecks import snapshot_geometry, analyse_geometry, snapshot_gcode, analyse_gcode
 
 import math
 import threading
@@ -523,6 +524,8 @@ class SettingsTools:
         ]
 
         definitions.extend([
+            ("validate_geometry", "Проверить сетки активного стола и параметры 5D. Частичная проверка: обязательно сообщи not_checked, не объявляй готовность к печати.", {}, []),
+            ("validate_toolpaths", "Частичный анализ имеющегося G-code: команды движения и диапазоны записанных координат. Не симуляция столкновений. Сообщи not_checked.", {}, []),
             ("list_materials", "Список существующих профилей для текущего принтера и активного экструдера. Поиск по названию/типу/бренду, например ASA. Возвращает идентификаторы и описание, если оно есть. Это не проверка свойств по ТЗ.",
              {"query": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, []),
             ("set_material", "Выбрать профиль из list_materials по явной команде пользователя. Передай все три ID из списка. Прочитай настройки заново после переключения; при requires_user_action остановись.",
@@ -550,6 +553,12 @@ class SettingsTools:
         return result
 
     def call(self, name, arguments, cancel_event=None, deadline=None):
+        if name in ("validate_geometry", "validate_toolpaths"):
+            if not isinstance(arguments, dict) or arguments:
+                raise ValueError("Инструмент не принимает аргументов.")
+            snapshot, analyse = (snapshot_geometry, analyse_geometry) if name == "validate_geometry" else (snapshot_gcode, analyse_gcode)
+            data = self.on_main_thread(snapshot, cancel_event, deadline)
+            return analyse(data, cancel_event, deadline)
         allowed = {
             "list_materials": (self._materials.list_materials, {"query", "offset", "limit"}),
             "set_material": (self._materials.set_material, {"material_id", "extruder_id", "printer_id"}),
