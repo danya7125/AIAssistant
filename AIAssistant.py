@@ -1,138 +1,23 @@
 
-import ssl
-import json
-import os
 import threading
+import webbrowser
 
 from .ChatWindow import ChatWindow
 from .SettingsTools import SettingsTools
 from .AgentClient import AgentClient
-
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from urllib.parse import unquote, urlsplit
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from .WebServer import ChatServer, Handler
 
 from PyQt5.QtCore import QThread
 from PyQt5.QtWidgets import (
     QDialog,
     QFormLayout,
     QLineEdit,
+    QMessageBox,
     QPushButton,
-    QPlainTextEdit,
 )
 
 from UM.Application import Application
 from UM.Extension import Extension
-
-
-WEB_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "web"
-)
-
-
-# HTTP-сервер для возможного веб-интерфейса
-class ChatServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
-
-class Handler(SimpleHTTPRequestHandler):
-
-    def translate_path(self, path):
-        # Разрешаем доступ только к файлам web
-        path = unquote(urlsplit(path).path)
-
-        parts = [
-            part
-            for part in path.split("/")
-            if part not in ("", ".", "..")
-            and "\\" not in part
-            and ":" not in part
-        ]
-
-        return os.path.join(WEB_DIR, *parts)
-
-    def send_json(self, status, data):
-        body = json.dumps(
-            data,
-            ensure_ascii=False
-        ).encode("utf-8")
-
-        self.send_response(status)
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8"
-        )
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-
-        try:
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def do_POST(self):
-        if self.path != "/api/message":
-            self.send_json(
-                404,
-                {"reply": "Неизвестный адрес"}
-            )
-            return
-
-        try:
-            length = int(
-                self.headers.get("Content-Length", "0")
-            )
-
-            if length <= 0 or length > 100000:
-                self.send_json(
-                    400,
-                    {"reply": "Недопустимый размер запроса"}
-                )
-                return
-
-            data = json.loads(
-                self.rfile.read(length).decode("utf-8")
-            )
-
-            if not isinstance(data, dict):
-                self.send_json(
-                    400,
-                    {"reply": "Ожидается JSON-объект"}
-                )
-                return
-
-            text = data.get("text", "")
-
-            if not isinstance(text, str) or not text.strip():
-                self.send_json(
-                    400,
-                    {"reply": "Введите сообщение"}
-                )
-                return
-
-            # Веб-обработчик не обращается к Qt напрямую
-            reply = self.server.assistant.ask_llm(
-                text.strip()
-            )
-
-            self.send_json(
-                200,
-                {"reply": reply}
-            )
-
-        except Exception:
-            self.send_json(
-                500,
-                {
-                    "reply": (
-                        "Ошибка обработки запроса. "
-                        "Проверьте настройки LLM."
-                    )
-                }
-            )
 
 
 # Основной класс плагина STE Slicer
@@ -145,12 +30,17 @@ class AIAssistant(Extension):
         self.setMenuName("AI Assistant")
         self.addMenuItem("Settings", self.showSettings)
         self.addMenuItem("Open chat", self.showChat)
+        self.addMenuItem("Open web chat", self.showWebChat)
 
         self._settings_tools = SettingsTools()
         self._agent = AgentClient(self._settings_tools)
         self._server = None
         self._lock = threading.Lock()
         self._history = []
+        self._web_events = []
+        self._web_event_id = 0
+        self._web_event_lock = threading.Lock()
+        self._web_request_lock = threading.Lock()
 
         self._preferences = (
             Application.getInstance().getPreferences()
@@ -281,6 +171,85 @@ class AIAssistant(Extension):
         window.activateWindow()
         window.input.setFocus()
 
+    def showWebChat(self):
+        try:
+            if self._server is None:
+                self._server = ChatServer(
+                    ("127.0.0.1", 0),
+                    Handler
+                )
+                self._server.assistant = self
+                worker = threading.Thread(
+                    target=self._server.serve_forever
+                )
+                worker.daemon = True
+                worker.start()
+
+            url = "http://127.0.0.1:{0}/".format(
+                self._server.server_address[1]
+            )
+            if not webbrowser.open(url):
+                QMessageBox.warning(
+                    None,
+                    "AI Assistant",
+                    "Не удалось открыть браузер. Адрес чата: " + url
+                )
+        except OSError as error:
+            QMessageBox.warning(
+                None,
+                "AI Assistant",
+                "Не удалось запустить веб-чат: " + str(error)
+            )
+
+    def get_web_history(self):
+        return [
+            {"role": item["role"], "content": item["content"]}
+            for item in list(self._history)
+            if item.get("role") in ("user", "assistant")
+            and isinstance(item.get("content"), str)
+        ]
+
+    def get_web_event_cursor(self):
+        with self._web_event_lock:
+            return self._web_event_id
+
+    def get_web_events(self, since):
+        with self._web_event_lock:
+            events = [
+                item for item in self._web_events
+                if item["id"] > since
+            ]
+            return events, self._web_event_id
+
+    def _record_web_event(self, event):
+        with self._web_event_lock:
+            self._web_event_id += 1
+            self._web_events.append({
+                "id": self._web_event_id,
+                "event": event
+            })
+            if len(self._web_events) > 500:
+                del self._web_events[:-500]
+
+    def ask_from_web(self, text):
+        if not self._web_request_lock.acquire(False):
+            raise RuntimeError("Веб-чат уже обрабатывает сообщение.")
+
+        try:
+            self._record_web_event({
+                "phase": "status",
+                "message": "Ожидаем ответ…"
+            })
+            settings = self._settings_tools.on_main_thread(
+                self.get_print_settings
+            )
+            return self.ask_llm(
+                text,
+                print_settings=settings
+            )
+        finally:
+            self._web_request_lock.release()
+
     # Отправка запроса к нейросети
     def ask_llm(self, text, print_settings=None, progress=None, cancel_event=None, task_text=None):
         config = self._config.copy()
@@ -291,9 +260,14 @@ class AIAssistant(Extension):
         if not self._lock.acquire(False):
             return "Предыдущий запрос ещё выполняется. Дождитесь ответа."
         try:
+            def report_progress(event):
+                self._record_web_event(event)
+                if progress is not None:
+                    progress(event)
+
             reply = self._agent.run(
                 config, text, self._history,
-                print_settings=print_settings, progress=progress, cancel_event=cancel_event, task_text=task_text
+                print_settings=print_settings, progress=report_progress, cancel_event=cancel_event, task_text=task_text
             )
             self._history.extend([
                 {"role": "user", "content": text},
