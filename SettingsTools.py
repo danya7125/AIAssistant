@@ -1,10 +1,11 @@
-from .MaterialCards import MaterialCards
-from .MaterialKnowledge import MaterialKnowledge
+﻿from .OrientationAnalysis import analyse as analyse_orientation_mesh
+from .SceneTools import SceneTools
 from .GeometryChecks import snapshot_geometry, analyse_geometry, snapshot_gcode, analyse_gcode
 
 import math
 import threading
 import time
+import numpy as np
 from .SliceMonitor import SliceMonitor
 from .MaterialTools import MaterialTools
 
@@ -21,18 +22,41 @@ class SettingsTools:
         "layer_height_0",
         "infill_sparse_density",
         "infill_pattern",
+        "infill_line_distance",
         "wall_thickness",
         "wall_line_count",
+        "outer_inset_first",
         "top_layers",
         "bottom_layers",
+        "top_bottom_thickness",
+        "skin_outline_count",
         "material_print_temperature",
+        "material_print_temperature_layer_0",
         "material_bed_temperature",
+        "material_bed_temperature_layer_0",
         "speed_print",
+        "speed_wall",
+        "speed_infill",
+        "speed_topbottom",
         "speed_travel",
+        "speed_support",
         "support_enable",
         "support_type",
+        "support_tree_enable",
         "support_pattern",
+        "support_roof_enable",
+        "support_roof_density",
+        "support_roof_line_distance",
+        "support_top_distance",
+        "support_bottom_distance",
+        "support_z_distance",
+        "support_xy_distance",
+        "support_interface_enable",
+        "support_interface_density",
         "adhesion_type",
+        "brim_width",
+        "skirt_brim_minimal_length",
+        "draft_shield_enabled",
         "cool_fan_enabled",
         "cool_fan_speed",
         "retraction_enable",
@@ -43,14 +67,59 @@ class SettingsTools:
         "cylindrical_round_segments"
     ]
 
+    # Порядок применения родительских переключателей перед дочерними параметрами
+    PARENT_KEYS_PRIORITY = {
+        "printing_mode": 0,
+        "support_enable": 1,
+        "support_tree_enable": 2,
+        "support_interface_enable": 3,
+        "support_roof_enable": 4,
+        "adhesion_type": 5,
+        "cool_fan_enabled": 6,
+        "retraction_enable": 7
+    }
+
+    KEY_ALIASES = {
+        "infill_density": "infill_sparse_density",
+        "infill_percent": "infill_sparse_density",
+        "print_temperature": "material_print_temperature",
+        "nozzle_temperature": "material_print_temperature",
+        "extruder_temperature": "material_print_temperature",
+        "temperature_nozzle": "material_print_temperature",
+        "initial_layer_temperature": "material_print_temperature_layer_0",
+        "first_layer_temperature": "material_print_temperature_layer_0",
+        "bed_temperature": "material_bed_temperature",
+        "build_plate_temperature": "material_bed_temperature",
+        "first_layer_bed_temperature": "material_bed_temperature_layer_0",
+        "initial_layer_bed_temperature": "material_bed_temperature_layer_0",
+        "initial_layer_height": "layer_height_0",
+        "first_layer_height": "layer_height_0",
+        "print_speed": "speed_print",
+        "wall_speed": "speed_wall",
+        "infill_speed": "speed_infill",
+        "travel_speed": "speed_travel",
+        "support_speed": "speed_support",
+        "top_bottom_speed": "speed_topbottom",
+        "fan_speed": "cool_fan_speed",
+        "fan_enabled": "cool_fan_enabled",
+        "cooling_fan_enabled": "cool_fan_enabled",
+        "enable_support": "support_enable",
+        "supports_enabled": "support_enable",
+        "tree_support": "support_tree_enable",
+        "tree_support_enable": "support_tree_enable",
+        "platform_adhesion": "adhesion_type",
+        "build_plate_adhesion": "adhesion_type",
+        "wall_count": "wall_line_count",
+        "perimeters": "wall_line_count"
+    }
+
     EDITABLE_TYPES = ("bool", "int", "float", "enum")
     PRINTING_MODES = ("classic", "cylindrical", "cylindrical_full")
 
     def __init__(self):
+        self._scene_tools = SceneTools()
         self._slice_monitor = SliceMonitor()
         self._materials = MaterialTools()
-        self._knowledge = MaterialKnowledge()
-        self._cards = MaterialCards()
         self._search_cache = {}
 
     def on_main_thread(self, function, cancel_event=None, deadline=None):
@@ -112,6 +181,17 @@ class SettingsTools:
         )
 
         return global_stack, extruder_stack
+
+    def _resolve_key(self, key, available_keys):
+        if not isinstance(key, str):
+            return None
+        clean = key.strip()
+        if clean in available_keys:
+            return clean
+        alias = self.KEY_ALIASES.get(clean.lower())
+        if alias and alias in available_keys:
+            return alias
+        return None
 
     def _stack(self, key, stacks):
         global_stack, extruder_stack = stacks
@@ -196,9 +276,10 @@ class SettingsTools:
 
     def read(self, keys=None):
         stacks = self._stacks()
+        available = stacks[0].getAllKeys()
 
         if keys is None:
-            keys = self.MAIN_SETTINGS
+            keys = [k for k in self.MAIN_SETTINGS if k in available]
 
         if (
             not isinstance(keys, (list, tuple))
@@ -210,16 +291,16 @@ class SettingsTools:
 
         result = {}
 
-        for key in keys:
-            stack = self._stack(key, stacks)
-            value = stack.getProperty(key, "value")
-
-            if value is not None and not isinstance(
-                value, (str, int, float, bool)
-            ):
-                value = str(value)
-
-            result[key] = value
+        for raw_key in keys:
+            # Строгая проверка: синонимы и выдуманные ключи запрещены
+            if raw_key not in available:
+                raise ValueError(
+                    "Недопустимый параметр '{0}'. Синонимы запрещены. Используйте только настоящие ключи из list_print_settings.".format(raw_key)
+                )
+            
+            # Читаем значение параметра из стека
+            stack = self._stack(raw_key, stacks)
+            result[raw_key] = stack.getProperty(raw_key, "value")
 
         return result
 
@@ -244,7 +325,6 @@ class SettingsTools:
         found = []
 
         for key in sorted(global_stack.getAllKeys()):
-            # Only static search text is cached; values/bounds remain live.
             cache_key = (global_stack.getId(), key)
             searchable = self._search_cache.get(cache_key)
             if searchable is None:
@@ -279,6 +359,7 @@ class SettingsTools:
         }
 
     def _validate(self, key, value, stack):
+        """Приводит значение к типу параметра слайсера и проверяет допустимые границы."""
         meta = self._metadata(key, stack)
 
         if not self._editable(key, meta):
@@ -289,62 +370,60 @@ class SettingsTools:
         kind = meta["type"]
 
         if kind == "bool":
-            if type(value) is not bool:
-                raise ValueError(
-                    key + ": требуется true или false."
-                )
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                low = value.strip().lower()
+                if low in ("true", "1", "yes", "on", "да"):
+                    return True
+                if low in ("false", "0", "no", "off", "нет"):
+                    return False
+            if isinstance(value, (int, float)) and value in (0, 1):
+                return bool(value)
+            raise ValueError(key + ": требуется true или false.")
 
         elif kind in ("int", "float"):
-            if type(value) not in (int, float):
-                raise ValueError(
-                    key + ": требуется число."
-                )
-
-            if not math.isfinite(value):
-                raise ValueError(
-                    key + ": число должно быть конечным."
-                )
-
-            if kind == "int":
-                if int(value) != value:
-                    raise ValueError(
-                        key + ": требуется целое число."
-                    )
-                value = int(value)
+            if isinstance(value, bool):
+                raise ValueError(key + ": требуется число.")
+            if isinstance(value, str):
+                try:
+                    value = float(value.strip().replace(",", "."))
+                except Exception:
+                    raise ValueError(key + ": требуется число.")
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(key + ": число должно быть конечным.")
 
             minimum = meta.get("minimum_value")
             maximum = meta.get("maximum_value")
 
             if minimum is not None and value < minimum:
-                raise ValueError(
-                    "{}: значение меньше минимума {}.".format(
-                        key, minimum
-                    )
-                )
-
+                raise ValueError(key + ": значение ниже минимума " + str(minimum))
             if maximum is not None and value > maximum:
-                raise ValueError(
-                    "{}: значение больше максимума {}.".format(
-                        key, maximum
-                    )
-                )
+                raise ValueError(key + ": значение выше максимума " + str(maximum))
+
+            if kind == "int":
+                value = int(round(float(value)))
+            else:
+                value = float(value)
 
         elif kind == "enum":
             options = meta.get("options", {})
+            val_str = str(value).strip() if value is not None else ""
+            if val_str not in options:
+                matched = None
+                for opt_key, opt_label in options.items():
+                    if val_str.lower() in (str(opt_key).lower(), str(opt_label).lower()):
+                        matched = opt_key
+                        break
+                if matched is None:
+                    raise ValueError(
+                        key + ": доступные варианты: " + ", ".join(options)
+                    )
+                val_str = matched
 
-            if not isinstance(value, str) or value not in options:
-                raise ValueError(
-                    key + ": доступные варианты: "
-                    + ", ".join(options)
-                )
-
-            if (
-                key == "printing_mode"
-                and value not in self.PRINTING_MODES
-            ):
-                raise ValueError(
-                    "Разрешены только 3D, 5D Spiral и 5D."
-                )
+            if key == "printing_mode" and val_str not in self.PRINTING_MODES:
+                raise ValueError("Разрешены только 3D, 5D Spiral и 5D.")
+            value = val_str
 
         return value
 
@@ -352,10 +431,10 @@ class SettingsTools:
         if (
             not isinstance(values, dict)
             or not values
-            or len(values) > 25
+            or len(values) > 60
         ):
             raise ValueError(
-                "values должен содержать от 1 до 25 параметров."
+                "values должен содержать от 1 до 60 параметров."
             )
 
         if any(not isinstance(k, str) for k in values):
@@ -364,11 +443,45 @@ class SettingsTools:
             )
 
         stacks = self._stacks()
-        prepared = []
+        available = stacks[0].getAllKeys()
+        resolved_map = {}
+        skipped = []
 
-        for key, value in values.items():
-            stack = self._stack(key, stacks)
-            value = self._validate(key, value, stack)
+        for raw_key, raw_value in values.items():
+            # Строгая проверка: синонимы и выдуманные ключи запрещены
+            if raw_key not in available:
+                raise ValueError(
+                    "Недопустимый параметр '{0}'. Синонимы запрещены. Используйте только настоящие ключи из list_print_settings.".format(raw_key)
+                )
+            resolved_map[raw_key] = raw_value
+
+        # Если переданы дочерние настройки поддержек (support_tree_enable=True, support_roof_enable=True),
+        # автоматически гарантируем, что support_enable тоже включён
+        if any(
+            resolved_map.get(k) in (True, "true", "True", 1)
+            for k in ("support_tree_enable", "support_roof_enable", "support_interface_enable")
+        ):
+            if "support_enable" in available:
+                resolved_map["support_enable"] = True
+
+        ordered_items = sorted(
+            resolved_map.items(),
+            key=lambda kv: self.PARENT_KEYS_PRIORITY.get(kv[0], 100)
+        )
+
+        prepared = []
+        normalized_keys = []
+
+        for key, raw_value in ordered_items:
+            try:
+                stack = self._stack(key, stacks)
+                value = self._validate(key, raw_value, stack)
+            except Exception as err:
+                skipped.append({
+                    "key": key,
+                    "reason": str(err)
+                })
+                continue
 
             container = stack.userChanges
             existed = key in container.getAllKeys()
@@ -386,8 +499,17 @@ class SettingsTools:
                 existed,
                 old_override
             ))
+            normalized_keys.append(key)
 
-        before = self.read(list(values))
+        if not prepared:
+            raise ValueError(
+                "Ни один из переданных параметров не удалось применить: "
+                + "; ".join("{0} ({1})".format(s["key"], s["reason"]) for s in skipped)
+            )
+
+        if skipped:
+            raise ValueError("Пакет не применён: " + "; ".join(x['key'] + ': ' + x['reason'] for x in skipped))
+        before = self.read(normalized_keys)
         applied = []
 
         try:
@@ -400,35 +522,36 @@ class SettingsTools:
 
                 container.setProperty(key, "value", value)
 
-            # Re-check after all updates.
+            active_keys = []
             for item in prepared:
                 key, value, stack, container, existed, old = item
-
-                self._validate(key, value, stack)
-
-                if stack.getProperty(key, "enabled") is False:
-                    raise ValueError(
-                        "Параметр неактивен: " + key
-                    )
 
                 state = str(
                     stack.getProperty(key, "validationState")
                 )
 
+                if stack.getProperty(key, "enabled") is False:
+                    # Если родительский переключатель выключен (например, support_enable=False),
+                    # не сбрасываем весь пакет из-за отключенных дочерних опций
+                    if key.startswith("support_") and not stack.getProperty("support_enable", "value"):
+                        continue
+                    if key.startswith("cool_fan_") and not stack.getProperty("cool_fan_enabled", "value"):
+                        continue
+                    if key.startswith("retraction_") and not stack.getProperty("retraction_enable", "value"):
+                        continue
+                    raise ValueError(key + ": неактивен или отклонён; весь пакет откатан.")
                 if "Error" in state or "Exception" in state:
-                    raise ValueError(
-                        "Слайсер отклонил {}: {}".format(
-                            key, state
-                        )
-                    )
+                    raise ValueError(key + ": ошибка валидации слайсера; весь пакет откатан.")
+                actual = stack.getProperty(key, "value")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    if not isinstance(actual, (int, float)) or not math.isclose(float(actual), float(value), rel_tol=1e-6, abs_tol=1e-6):
+                        raise ValueError(key + ": значение после записи отличается от запрошенного.")
+                elif actual != value:
+                    raise ValueError(key + ": значение после записи отличается от запрошенного.")
 
-            after = self.read(list(values))
+                active_keys.append((key, value))
 
-            for key, value, stack, container, existed, old in prepared:
-                if after[key] != value:
-                    raise ValueError(
-                        "Слайсер не применил значение: " + key
-                    )
+            after = self.read(normalized_keys)
 
         except Exception as error:
             failures = []
@@ -453,58 +576,44 @@ class SettingsTools:
 
             raise
 
-        return {
+        applied_key_set = {k for k, _ in active_keys}
+        response = {
             "changes": [
                 {
                     "key": key,
-                    "before": before[key],
-                    "after": after[key]
+                    "before": before.get(key),
+                    "after": after.get(key)
                 }
-                for key in values
+                for key in normalized_keys if key in applied_key_set
             ],
             "scope": (
                 "Текущий профиль и активный экструдер; "
                 "без настроек отдельных моделей."
             )
         }
+        if skipped:
+            response["skipped"] = skipped
+        return response
 
-    def schemas(self):
+    def schemas(self, include_diagnostics=False):
+        """
+        По умолчанию предоставляет 3 целевых инструмента для мгновенной настройки за 1 шаг.
+        Диагностические инструменты подключаются только если пользователь явно попросил проверить сетку/G-code или найти редкий параметр.
+        """
         definitions = [
             (
-                "list_print_settings",
-                "Найти реальные параметры текущего принтера. "
-                "Возвращает типы, значения, варианты и границы.",
+                "set_material",
+                "ШАГ 1: Выбрать профиль материала по его material_id из списка materials в начальном контексте. Достаточно передать только material_id.",
                 {
-                    "query": {"type": "string"},
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 50
-                    }
+                    "material_id": {"type": "string"},
+                    "extruder_id": {"type": "string"},
+                    "printer_id": {"type": "string"}
                 },
-                []
-            ),
-            (
-                "get_print_settings",
-                "Прочитать актуальные настройки печати.",
-                {
-                    "keys": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    }
-                },
-                []
+                ["material_id"]
             ),
             (
                 "set_print_settings",
-                "Изменить параметры по запросу пользователя. "
-                "Сначала проверь типы и границы через "
-                "list_print_settings. Не изменяй параметры "
-                "без запроса пользователя.",
+                "ШАГ 2: Применить ВСЕ параметры печати в слайсере за один вызов (material_print_temperature, material_print_temperature_layer_0, material_bed_temperature, material_bed_temperature_layer_0, layer_height, wall_line_count, outer_inset_first, infill_sparse_density, infill_pattern, support_enable, support_tree_enable, support_roof_enable, support_top_distance, adhesion_type, speed_print, cool_fan_speed, retraction_amount, retraction_speed).",
                 {
                     "values": {
                         "type": "object",
@@ -521,24 +630,51 @@ class SettingsTools:
             ),
             (
                 "start_slicing",
-                "Запустить процесс нарезки (слайсинга) модели для генерации G-code.",
+                "ШАГ 3: Запустить нарезку (слайсинг) модели для генерации G-code.",
                 {},
                 []
             )
         ]
 
         definitions.extend([
-            ("get_material_info", "Полная компактная карточка точной марки: все свойства, печать и сушка за один вызов. Без material — текущий материал. Сравнивает настройки только если карточка однозначно соответствует текущей марке; ничего не меняет.", {"material": {"type": "string"}}, []),
-            ("search_material_knowledge", "Поиск локального справочника по точной марке (например PC G20) или свойству. Возвращает ID, не свойства. Для чтения вызови get_material_knowledge. Пустой запрос показывает каталог.", {"query": {"type": "string", "maxLength": 300}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, []),
-            ("get_material_knowledge", "Прочитать части документа из локального справочника. next_offset означает продолжение. Не переносить свойства на другие марки. requires_review означает непроверенное извлечение PDF.", {"document_id": {"type": "string"}, "query": {"type": "string", "maxLength": 300, "description": "Фильтр по разделу или слову: температура, печати, свойства. Пустой — все части."}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 3}}, ["document_id"]),
-            ("validate_geometry", "Проверить сетки активного стола и параметры 5D. Частичная проверка: обязательно сообщи not_checked, не объявляй готовность к печати.", {}, []),
-            ("validate_toolpaths", "Частичный анализ имеющегося G-code: команды движения и диапазоны записанных координат. Не симуляция столкновений. Сообщи not_checked.", {}, []),
-            ("list_materials", "Список существующих профилей для текущего принтера и активного экструдера. Поиск по названию/типу/бренду, например ASA. Возвращает идентификаторы и описание, если оно есть. Это не проверка свойств по ТЗ.",
-             {"query": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, []),
-            ("set_material", "Выбрать профиль из list_materials по явной команде пользователя. Передай все три ID из списка. Прочитай настройки заново после переключения; при requires_user_action остановись.",
-             {"material_id": {"type": "string"}, "extruder_id": {"type": "string"}, "printer_id": {"type": "string"}}, ["material_id", "extruder_id", "printer_id"]),
-            ("get_slicing_status", "Проверить фактическое завершение нарезки и наличие G-code. completed не означает сохранение файла.", {}, []),
-            ("get_print_context", "Текущий принтер, материал, профиль и размеры загруженных моделей. Не подтверждает физические характеристики материала.", {}, [])
+            ("list_materials", "Найти доступный профиль материала; query пустой — список, offset для продолжения.", {"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}, []),
+            ("get_material_details", "Прочитать параметры штатного профиля материала по точному ID.", {"material_id":{"type":"string"}}, ["material_id"]),
+            ("get_print_settings", "Прочитать действующие значения параметров.", {"keys":{"type":"array","items":{"type":"string"}}}, [])
+        ])
+
+        if include_diagnostics:
+            definitions.extend([
+                (
+                    "validate_geometry",
+                    "Проверить сетки активного стола и параметры 5D по явному запросу пользователя. Обязательно сообщи not_checked.",
+                    {},
+                    []
+                ),
+                (
+                    "validate_toolpaths",
+                    "Проверить имеющийся G-code по явному запросу пользователя. Обязательно сообщи not_checked.",
+                    {},
+                    []
+                ),
+                (
+                    "list_print_settings",
+                    "Найти редкие параметры текущего принтера, если их нет в начальном контексте.",
+                    {
+                        "query": {"type": "string"},
+                        "offset": {"type": "integer", "minimum": 0},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+                    },
+                    []
+                )
+            ])
+
+        definitions.extend([
+            ('get_slicing_status', 'Получить статус нарезки и оценки времени/расхода из свежего G-code при завершении.', {}, []),
+            ('get_scene_models', 'Модели активного стола, их ID, размеры и статус загрузки. Y — высота, X/Z — стол.', {}, []),
+            ('load_model', 'Загрузить локальный STL/OBJ по абсолютному пути, указанному пользователем. Не придумывать путь. Дождаться completed.', {'path':{'type':'string'}}, ['path']),
+            ('analyse_orientation', 'Анализ 26 осевых/наклонных ориентаций без изменения сцены. Контакт, нависания, геометрический proxy поддержек, ступенчатости и направление растяжения; ограничения обязательны. Направление нагрузки и критические грани только из явных данных пользователя, не угадывать.', {'model_id':{'type':'string'},'tensile_load_direction':{'type':'array','items':{'type':'number'},'minItems':3,'maxItems':3},'critical_face_indices':{'type':'array','items':{'type':'integer','minimum':0},'minItems':1,'maxItems':200}}, ['model_id']),
+            ('orient_model', 'В 3D повернуть модель относительно текущего положения и опустить на стол. Y — вертикаль. Перед вызовом изучить analyse_orientation.', {'model_id':{'type':'string'}, 'axis':{'type':'string','enum':['x','y','z']}, 'degrees':{'type':'number','minimum':-360,'maximum':360}}, ['model_id','axis','degrees']),
+            ('arrange_models', 'В 3D расставить все модели активного прямоугольного стола без пересечения bounding box. Зазор должен учитывать кайму и поддержки; после проверить validate_geometry.', {'margin_mm':{'type':'number','minimum':2,'maximum':100}}, [])
         ])
         result = []
 
@@ -560,25 +696,32 @@ class SettingsTools:
         return result
 
     def call(self, name, arguments, cancel_event=None, deadline=None):
+        if name == 'analyse_orientation':
+            if not isinstance(arguments,dict) or set(arguments)-{'model_id','tensile_load_direction','critical_face_indices'} or not isinstance(arguments.get('model_id'),str):
+                raise ValueError('Неверные аргументы анализа ориентации.')
+            snapshot = self.on_main_thread(lambda: self._scene_tools.orientation_snapshot(arguments['model_id']), cancel_event, deadline)
+            return analyse_orientation_mesh(snapshot, arguments.get('tensile_load_direction'), arguments.get('critical_face_indices'), cancel_event, deadline)
+
         if name in ("validate_geometry", "validate_toolpaths"):
             if not isinstance(arguments, dict) or arguments:
                 raise ValueError("Инструмент не принимает аргументов.")
             snapshot, analyse = (snapshot_geometry, analyse_geometry) if name == "validate_geometry" else (snapshot_gcode, analyse_gcode)
             data = self.on_main_thread(snapshot, cancel_event, deadline)
-            return analyse(data, cancel_event, deadline)
-        if name in ("search_material_knowledge", "get_material_knowledge"):
-            keys = {"query", "offset", "limit"} if name == "search_material_knowledge" else {"document_id", "offset", "limit", "query"}
-            if not isinstance(arguments, dict) or set(arguments) - keys:
-                raise ValueError("Неверные аргументы справочника.")
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("Запрос отменён.")
-            if deadline is not None and time.monotonic() >= deadline:
-                raise RuntimeError("Истёк лимит задачи.")
-            function = self._knowledge.search if name == "search_material_knowledge" else self._knowledge.read
-            return function(**arguments)
+            report = analyse(data, cancel_event, deadline)
+            if name == 'validate_geometry':
+                self._scene_tools.dirty = False
+            return report
+        if name == 'start_slicing':
+            self.on_main_thread(self._scene_tools.ready, cancel_event, deadline)
+            if self._scene_tools.dirty:
+                raise ValueError('После изменения сцены сначала вызовите validate_geometry и оцените её результат.')
         allowed = {
-            "get_material_info": (self.get_material_info, {"material"}),
+            'get_scene_models': (self._scene_tools.get_scene_models, set()),
+            'load_model': (self._scene_tools.load_model, {'path'}),
+            'orient_model': (self._scene_tools.orient_model, {'model_id','axis','degrees'}),
+            'arrange_models': (self._scene_tools.arrange_models, {'margin_mm'}),
             "list_materials": (self._materials.list_materials, {"query", "offset", "limit"}),
+            "get_material_details": (self._materials.get_material_details, {"material_id"}),
             "set_material": (self._materials.set_material, {"material_id", "extruder_id", "printer_id"}),
             "list_print_settings": (
                 self.describe,
@@ -594,7 +737,8 @@ class SettingsTools:
             ),
             "start_slicing": (self.start_slicing, set()),
             "get_slicing_status": (self.get_slicing_status, set()),
-            "get_print_context": (self.get_print_context, set())
+            "get_print_context": (self.get_print_context, set()),
+            "auto_export": (self.auto_export, set())
         }
 
         if name not in allowed or not isinstance(arguments, dict):
@@ -609,52 +753,120 @@ class SettingsTools:
                 "Неизвестные аргументы инструмента."
             )
 
-        return self.on_main_thread(
-            lambda: function(**arguments), cancel_event, deadline
-        )
+        result = self.on_main_thread(lambda: function(**arguments), cancel_event, deadline)
+        if name == 'load_model':
+            while result.get('status') == 'loading':
+                if cancel_event is not None and cancel_event.wait(.15):
+                    raise RuntimeError('Ожидание отменено; штатная загрузка файла может завершиться позже.')
+                if cancel_event is None:
+                    time.sleep(.15)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RuntimeError('Истёк срок ожидания загрузки; проверьте сцену.')
+                scene = self.on_main_thread(self._scene_tools.get_scene_models, cancel_event, deadline)
+                result['status'] = scene['loads'].get(result['path'], 'failed')
+                result['scene'] = scene
+            if result.get('status') != 'completed':
+                raise ValueError(result.get('status'))
+            result['changes'] = [{'key':'loaded_model','before':None,'after':result['path']}]
+        return result
 
     def initial_context(self):
-        """One Qt dispatch supplies context and exact primary setting metadata."""
+        """Полный и структурированный снимок контекста, настроек и паспортов всех материалов за одно обращение к Qt."""
         global_stack, extruder = self._stacks()
         stacks = (global_stack, extruder)
         settings = []
         available = global_stack.getAllKeys()
+        values_map = self.read(None)
+
         for key in self.MAIN_SETTINGS:
             if key not in available:
                 continue
             stack = self._stack(key, stacks)
             meta = self._metadata(key, stack)
-            meta.pop("description", None)
-            meta["value"] = self.read([key])[key]
-            meta["editable"] = self._editable(key, meta)
-            meta["enabled"] = bool(stack.getProperty(key, "enabled"))
-            settings.append(meta)
-        result = {"context": self.get_print_context(), "settings": settings}
+            if not self._editable(key, meta):
+                continue
+            compact = {
+                "key": key,
+                "value": values_map.get(key),
+                "type": meta["type"],
+                "description": str(meta.get("description", ""))[:400],
+                "enabled": bool(stack.getProperty(key, "enabled"))
+            }
+            if "options" in meta:
+                compact["options"] = list(meta["options"].keys())
+            if "minimum_value" in meta or "maximum_value" in meta:
+                compact["range"] = [meta.get("minimum_value"), meta.get("maximum_value")]
+            settings.append(compact)
+
+        materials_list = []
+        materials_total = None
         try:
-            result["material_info"] = self.get_material_info()
-        except Exception as exc:
-            result["material_info"] = {"found": False, "error": str(exc)}
-        return result
+            m_res = self._materials.list_materials(limit=100)
+            materials_total = m_res.get("total")
+            for m in m_res.get("materials", []):
+                if not m.get("selectable", True):
+                    continue
+                materials_list.append({
+                    "material_id": m.get("material_id"),
+                    "brand": m.get("brand", ""),
+                    "name": m.get("name", ""),
+                    "type": m.get("material", ""),
+                    "nozzle_temp": m.get("default_material_print_temperature", m.get("material_print_temperature")),
+                    "bed_temp": m.get("default_material_bed_temperature", m.get("material_bed_temperature")),
+                    "fan_speed": m.get("cool_fan_speed"),
+                    "retraction_amount": m.get("retraction_amount"),
+                    "retraction_speed": m.get("retraction_speed"),
+                    "density": m.get("properties_density", m.get("density", "")),
+                    "description": str(m.get("description", "") or "")[:900],
+                    "adhesion_info": str(m.get("adhesion_info", "") or "")[:300]
+                })
+        except Exception:
+            pass
+        return {
+            "context": self.get_print_context(),
+            "settings": settings,
+            "materials": materials_list,
+            "materials_total": materials_total,
+            "materials_note": "Все доступные профили; остальные доступны через list_materials."
+        }
 
     def get_print_context(self):
         global_stack, extruder = self._stacks()
         active = extruder if extruder is not None else global_stack
+
         def container_name(attribute):
             container = getattr(active, attribute, None)
             return container.getName() if container is not None else None
+
         app = Application.getInstance()
         scene = app.getController().getScene()
         models = []
         for node in scene.getRoot().getAllChildren():
-            if node.getMeshData() is None or not node.callDecoration("isSliceable"):
+            mesh = node.getMeshData()
+            if mesh is None or not node.callDecoration("isSliceable") or node.callDecoration("getBuildPlateNumber") != app.getMultiBuildPlateModel().activeBuildPlate:
                 continue
             box = node.getBoundingBox()
-            models.append({"name": node.getName(),
-                           "size_mm": {"x": float(box.width), "y": float(box.height), "z": float(box.depth)},
-                           "build_plate": node.callDecoration("getBuildPlateNumber")})
-        return {"printer": global_stack.getName(), "material": container_name("material"),
-                "profile": container_name("quality"), "models": models,
-                "notes": "Название материала не подтверждает его свойства. Tg, прочность и химстойкость нужны из документации производителя. Размеры модели не заменяют расчёт прочности."}
+            has_overhangs = None
+            models.append({
+                "name": node.getName(),
+                "size_mm": {"x": float(box.width), "y": float(box.height), "z": float(box.depth)},
+                "has_critical_overhangs": has_overhangs,
+                "support_required": None,
+                "support_note": "Не определено: исходные нормали не доказывают необходимость поддержек.",
+                "build_plate": node.callDecoration("getBuildPlateNumber")
+            })
+        return {
+            "printer": {"id": global_stack.getId(), "name": global_stack.getName()},
+            "printer_id": global_stack.getId(),
+            "active_extruder": (
+                {"id": extruder.getId(), "name": extruder.getName()}
+                if extruder is not None else None
+            ),
+            "extruder_id": extruder.getId() if extruder is not None else None,
+            "material": container_name("material"),
+            "profile": container_name("quality"),
+            "models": models
+        }
 
     def start_slicing(self):
         self._stacks()
@@ -667,24 +879,7 @@ class SettingsTools:
     def cancel_slicing(self):
         return self.on_main_thread(self._slice_monitor.cancel)
 
-    def get_material_info(self, material=None):
-        global_stack, extruder = self._stacks()
-        active = extruder if extruder is not None else global_stack
-        container = getattr(active, "material", None)
-        current_name = container.getName() if container is not None else ""
-        card = self._cards.get(material or current_name)
-        card["current_material"] = current_name
-        current_card = self._cards.get(current_name) if current_name else {"found": False}
-        if card.get("found") and current_card.get("id") == card.get("id"):
-            values = {}
-            for key in self._cards.KEYS:
-                try:
-                    values.update(self.read([key]))
-                except Exception:
-                    values[key] = None
-            card["current_settings"] = values
-            card["comparison"] = self._cards.compare(card, values)
-        else:
-            card["comparison"] = []
-            card["comparison_note"] = "Текущий материал не совпал однозначно с карточкой; сравнение пропущено."
-        return card
+    def auto_export(self):
+        from .AutoExport import auto_export_project_and_gcode
+        return auto_export_project_and_gcode()
+

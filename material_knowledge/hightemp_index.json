@@ -1,1 +1,0 @@
-{"id": "hightemp_index", "name": "Серия HighTemp", "category": "hightemp", "requires_review": false, "chunks": [{"type": "list", "ordered": false, "items": ["PEEK", "PEI", "PPS", "PPS G40", "PPSU", "PSU"], "section": ""}]}

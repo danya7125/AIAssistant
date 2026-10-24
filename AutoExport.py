@@ -1,0 +1,117 @@
+"""
+AutoExport module for SteSlicer AIAssistant plugin.
+Automatically exports sliced G-Code and 3MF workspace to AIAssistant/output/<ModelName>/
+"""
+import os
+import re
+from UM.Application import Application
+from UM.Logger import Logger
+from UM.Mesh.MeshWriter import MeshWriter
+from UM.Workspace.WorkspaceWriter import WorkspaceWriter
+
+
+def clean_filename(name):
+    """Sanitize folder and file names for Windows filesystem."""
+    if not name or not isinstance(name, str):
+        return "Model"
+    cleaned = re.sub(r'[\\/*?:"<>|]', '_', name.strip())
+    cleaned = cleaned.strip('. ')
+    return cleaned if cleaned else "Model"
+
+
+def get_output_base_dir():
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    output_root = os.path.join(plugin_dir, "output")
+    if not os.path.exists(output_root):
+        try:
+            os.makedirs(output_root, exist_ok=True)
+        except Exception:
+            pass
+    return output_root
+
+
+def auto_export_project_and_gcode():
+    app = Application.getInstance()
+    scene = app.getController().getScene()
+    root = scene.getRoot()
+    plate = app.getMultiBuildPlateModel().activeBuildPlate
+    
+    # Check if G-code is ready
+    gcode_dict = getattr(scene, 'gcode_dict', None)
+    if not isinstance(gcode_dict, dict) or plate not in gcode_dict or not gcode_dict[plate]:
+        return {'ok': False, 'error': 'G-code не сформирован для активного стола.'}
+        
+    # Get active models and determine project/model name
+    sliceable_nodes = [
+        n for n in root.getAllChildren()
+        if n.getMeshData() is not None
+        and n.callDecoration('isSliceable')
+        and n.callDecoration('getBuildPlateNumber') == plate
+    ]
+    
+    if sliceable_nodes:
+        raw_name = sliceable_nodes[0].getName()
+    else:
+        raw_name = "Model"
+        
+    base_name = os.path.splitext(raw_name)[0]
+    model_name = clean_filename(base_name)
+    folder_name = model_name
+    
+    output_root = get_output_base_dir()
+    target_dir = os.path.join(output_root, folder_name)
+    
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except Exception as e:
+        return {'ok': False, 'error': 'Не удалось создать папку для экспорта: ' + str(e)}
+        
+    saved_files = []
+    errors = []
+    
+    # 1. Export G-Code
+    gcode_path = os.path.join(target_dir, "{0}.gcode".format(model_name))
+    try:
+        gcode_writer = app.getMeshFileHandler().getWriter("GCodeWriter")
+        if gcode_writer is not None:
+            with open(gcode_path, "wt", encoding="utf-8") as stream:
+                success = gcode_writer.write(stream, [root], MeshWriter.OutputMode.TextMode)
+                if success is not False:
+                    saved_files.append(gcode_path)
+                else:
+                    errors.append("GCodeWriter вернул False при экспорте.")
+        else:
+            with open(gcode_path, "wt", encoding="utf-8") as stream:
+                for line in gcode_dict[plate]:
+                    stream.write(line)
+            saved_files.append(gcode_path)
+    except Exception as e:
+        errors.append("Ошибка сохранения G-Code: " + str(e))
+        
+    # 2. Export 3MF Workspace
+    threemf_path = os.path.join(target_dir, "{0}.3mf".format(model_name))
+    try:
+        workspace_writer = app.getWorkspaceFileHandler().getWriter("3MFWriter")
+        if workspace_writer is not None:
+            with open(threemf_path, "wb") as stream:
+                success = workspace_writer.write(stream, [root], WorkspaceWriter.OutputMode.BinaryMode)
+                if success is not False:
+                    saved_files.append(threemf_path)
+                else:
+                    errors.append("3MFWriter вернул False.")
+        else:
+            mesh_3mf_writer = app.getMeshFileHandler().getWriter("3MFWriter")
+            if mesh_3mf_writer is not None:
+                with open(threemf_path, "wb") as stream:
+                    mesh_3mf_writer.write(stream, [root], MeshWriter.OutputMode.BinaryMode)
+                saved_files.append(threemf_path)
+    except Exception as e:
+        errors.append("Ошибка сохранения 3MF: " + str(e))
+        
+    return {
+        'ok': len(saved_files) > 0,
+        'target_dir': target_dir,
+        'saved_files': saved_files,
+        'model_name': model_name,
+        'errors': errors
+    }

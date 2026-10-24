@@ -4,227 +4,123 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>AI Assistant — STE Slicer</title>
-
-    <style>
-        /* Основной вид страницы */
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            margin: 0;
-            background: #eef3f9;
-            color: #182739;
-            font: 16px system-ui, sans-serif;
-        }
-
-        main {
-            max-width: 740px;
-            margin: 32px auto;
-            padding: 24px;
-            background: white;
-            border-radius: 16px;
-        }
-
-        h1 {
-            margin-top: 0;
-        }
-
-        p {
-            color: #53647b;
-        }
-
-        /* История переписки */
-        #messages {
-            height: 360px;
-            overflow: auto;
-            margin-bottom: 16px;
-            padding: 12px;
-            border: 1px solid #ccd6e4;
-            border-radius: 8px;
-        }
-
-        .message {
-            margin-bottom: 10px;
-            padding: 12px;
-            background: #edf2f8;
-            border-radius: 8px;
-            white-space: pre-wrap;
-            overflow-wrap: anywhere;
-        }
-
-        .user {
-            background: #ddebff;
-        }
-
-        .error {
-            background: #ffe9e9;
-        }
-
-        /* Форма отправки сообщения */
-        form {
-            display: flex;
-            gap: 8px;
-        }
-
-        textarea {
-            flex: 1;
-            min-width: 0;
-            padding: 12px;
-            border: 1px solid #aab9cb;
-            border-radius: 8px;
-            font: inherit;
-        }
-
-        button {
-            padding: 12px;
-            border: 0;
-            border-radius: 8px;
-            background: #1764d8;
-            color: white;
-            font: inherit;
-            cursor: pointer;
-        }
-
-        button:disabled {
-            opacity: 0.5;
-            cursor: wait;
-        }
-
-        #status {
-            font-size: 14px;
-        }
-
-        @media (max-width: 520px) {
-            main {
-                margin: 12px;
-                padding: 16px;
-            }
-
-            form {
-                flex-direction: column;
-            }
-        }
-    </style>
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <main>
-        <h1>AI Assistant</h1>
-        <p>Помощник по STE Slicer и 3D/5D-печати.</p>
+    <div class="app-shell">
+        <header class="topbar">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true">STE</span>
+                <span>
+                    <strong>AI Assistant</strong>
+                    <small>Помощник по STE Slicer</small>
+                </span>
+            </div>
+            <span class="connection-state">
+                <span class="connection-dot" aria-hidden="true"></span>
+                Локальный чат
+            </span>
+        </header>
 
-        <div id="messages" role="log" aria-live="polite"></div>
+        <main class="workspace">
+            <section class="chat-panel" aria-labelledby="chat-title">
+                <div class="panel-heading">
+                    <h1 id="chat-title">Чат</h1>
+                    <span class="privacy-label">Помощь по модели и настройкам печати</span>
+                </div>
 
-        <form id="chat">
-            <textarea
-                id="text"
-                rows="2"
-                aria-label="Сообщение"
-                placeholder="Напиши сообщение…"
-                required
-            ></textarea>
-            <button id="send" type="submit">Отправить</button>
-        </form>
+                <div id="messages" class="messages" role="log" aria-live="polite" aria-relevant="additions">
+                    <div class="welcome-card" id="welcome">
+                        <h2>Здравствуйте!</h2>
+                        <p>Задайте вопрос по STE Slicer или расскажите, с чем помочь.</p>
+                    </div>
+                </div>
 
-        <p id="status" role="status">
-            Enter — отправить · Shift+Enter — новая строка
-        </p>
-    </main>
+                <p id="status" class="status-text" role="status">Готов к работе</p>
+                <form id="chat" class="composer">
+                    <div id="attachment-list" class="attachment-list" aria-live="polite"></div>
+                    <label class="composer-input-label" for="text">Сообщение</label>
+                    <textarea
+                        id="text"
+                        rows="2"
+                        placeholder="Напишите сообщение…"
+                    ></textarea>
+                    <div class="composer-footer">
+                        <div class="composer-tools">
+                            <label class="attach-button" for="attachments" title="Прикрепить JPG, PNG, STL, OBJ или 3MF">
+                                <span aria-hidden="true">＋</span>
+                                <span>Прикрепить файл</span>
+                            </label>
+                            <input
+                                id="attachments"
+                                class="visually-hidden"
+                                type="file"
+                                accept=".jpg,.jpeg,.png,.stl,.obj,.3mf"
+                                multiple
+                                aria-label="Выбрать изображения или 3D-модели"
+                            >
+                            <span class="keyboard-hint">Enter — отправить · Shift+Enter — перенос строки</span>
+                        </div>
+                        <button id="send" class="send-button" type="submit">Отправить</button>
+                    </div>
+                </form>
+            </section>
 
-    <script>
-        'use strict';
+            <button
+                id="details-toggle"
+                class="details-toggle"
+                type="button"
+                aria-expanded="false"
+                aria-controls="side-panel"
+            >
+                <svg class="details-icon" viewBox="0 0 20 20" aria-hidden="true">
+                    <path d="M4 5h12M4 10h12M4 15h12"></path>
+                    <circle cx="7" cy="5" r="1.5"></circle>
+                    <circle cx="13" cy="10" r="1.5"></circle>
+                    <circle cx="8" cy="15" r="1.5"></circle>
+                </svg>
+                <span>Действия и слайсинг</span>
+                <svg class="details-chevron" viewBox="0 0 20 20" aria-hidden="true">
+                    <path d="m6 8 4 4 4-4"></path>
+                </svg>
+            </button>
 
-        const chatForm = document.getElementById('chat');
-        const messageInput = document.getElementById('text');
-        const sendButton = document.getElementById('send');
-        const messageList = document.getElementById('messages');
-        const statusText = document.getElementById('status');
+            <aside id="side-panel" class="side-panel" aria-label="Состояние работы">
+                <section class="side-card" aria-labelledby="activity-title">
+                    <div class="side-card-heading">
+                        <h2 id="activity-title">Действия помощника</h2>
+                    </div>
+                    <div id="activity-empty" class="empty-state">Здесь будут показаны действия и результаты.</div>
+                    <ol id="activity-list" class="activity-list" aria-live="polite"></ol>
+                </section>
 
-        const REQUEST_TIMEOUT_MS = 75000;
-        let isSending = false;
-
-        // Показываем текст безопасно: HTML из ответа не выполняется.
-        function addMessage(author, text, type) {
-            const messageElement = document.createElement('div');
-            messageElement.className = 'message ' + type;
-            messageElement.textContent = author + '\n' + text;
-
-            messageList.appendChild(messageElement);
-            messageList.scrollTop = messageList.scrollHeight;
-        }
-
-        async function sendMessage(event) {
-            event.preventDefault();
-
-            const messageText = messageInput.value.trim();
-            if (!messageText || isSending) {
-                return;
-            }
-
-            isSending = true;
-            sendButton.disabled = true;
-            addMessage('Вы', messageText, 'user');
-            messageInput.value = '';
-            statusText.textContent = 'Ожидаем ответ…';
-
-            const controller = new AbortController();
-            const timeoutId = setTimeout(function () {
-                controller.abort();
-            }, REQUEST_TIMEOUT_MS);
-
-            try {
-                // Python-плагин принимает сообщение и обращается к LLM.
-                const response = await fetch('/api/message', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ text: messageText }),
-                    signal: controller.signal
-                });
-
-                if (!response.ok) {
-                    throw new Error('HTTP ' + response.status);
-                }
-
-                const data = await response.json();
-                if (typeof data.reply !== 'string') {
-                    throw new Error('В ответе нет поля reply');
-                }
-
-                addMessage('Помощник', data.reply, 'assistant');
-                statusText.textContent = 'Ответ получен.';
-            } catch (error) {
-                const errorText = error.name === 'AbortError'
-                    ? 'Сервер не ответил за ' + REQUEST_TIMEOUT_MS / 1000 + ' секунд.'
-                    : error.message;
-
-                addMessage('Ошибка', errorText, 'error');
-                statusText.textContent =
-                    'Проверь, что слайсер открыт. Открывай чат через меню плагина.';
-
-                // Возвращаем неотправленный текст, не стирая новый черновик.
-                if (!messageInput.value) {
-                    messageInput.value = messageText;
-                }
-            } finally {
-                clearTimeout(timeoutId);
-                isSending = false;
-                sendButton.disabled = false;
-                messageInput.focus();
-            }
-        }
-
-        chatForm.addEventListener('submit', sendMessage);
-
-        // Enter отправляет сообщение, Shift+Enter добавляет новую строку.
-        messageInput.addEventListener('keydown', function (event) {
-            if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-                event.preventDefault();
-                chatForm.requestSubmit();
-            }
-        });
-
-        messageInput.focus();
-    </script>
+                <section class="side-card slicing-card" aria-labelledby="slicing-title">
+                    <div class="side-card-heading">
+                        <h2 id="slicing-title">Слайсинг</h2>
+                    </div>
+                    <div id="slicing-state" class="slicing-status">
+                        <span class="status-indicator" aria-hidden="true"></span>
+                        <span id="slicing-status">Ожидание</span>
+                    </div>
+                    <progress id="slicing-progress" max="100" value="0" aria-label="Прогресс слайсинга"></progress>
+                    <div class="slice-metrics">
+                        <div>
+                            <span>Время печати</span>
+                            <strong id="print-time">—</strong>
+                        </div>
+                        <div>
+                            <span>Материал</span>
+                            <strong id="material-usage">—</strong>
+                        </div>
+                    </div>
+                    <button id="open-folder-btn" class="open-folder-button" type="button" style="margin-top: 14px; width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid #ccd6e4; background: #ffffff; cursor: pointer; font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+                        <span>📂</span>
+                        <span>Открыть папку экспорта</span>
+                    </button>
+                </section>
+            </aside>
+        </main>
+    </div>
+    <script src="script.js"></script>
 </body>
 </html>

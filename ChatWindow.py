@@ -1,8 +1,10 @@
 
+import os
 import threading
 import json
 
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, pyqtSignal, QUrl
+from PyQt5.QtGui import QDesktopServices
 
 from PyQt5.QtWidgets import (
     QDialog,
@@ -102,6 +104,14 @@ class ChatWindow(QDialog):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_request)
         buttons.addWidget(self.cancel_button)
+
+        self.open_folder_button = QPushButton("📂 Открыть папку")
+        self.open_folder_button.setAutoDefault(False)
+        self.open_folder_button.setToolTip("Открыть папку с сохранёнными G-Code и 3MF")
+        self.open_folder_button.clicked.connect(self.open_output_folder)
+        buttons.addWidget(self.open_folder_button)
+
+        self._latest_export_dir = None
         buttons.addStretch()
 
         self.send_button = QPushButton(
@@ -260,7 +270,21 @@ class ChatWindow(QDialog):
             changes = output.get("result", {}).get("changes", [])
             text = "\n".join("{0}: {1} → {2}".format(c["key"], c["before"], c["after"])
                              for c in changes)
-            self.append_message("Изменения применены", text)
+            self.append_message("Изменения применены", text or "Без изменений")
+        elif name == "list_print_settings":
+            count = len(output.get("result", {}).get("settings", [])) if output.get("ok") else 0
+            self.append_message("Поиск параметров", "Найдено настроек: {0}".format(count))
+        elif name == "list_materials":
+            count = len(output.get("result", {}).get("materials", [])) if output.get("ok") else 0
+            self.append_message("Поиск материалов", "Найдено профилей: {0}".format(count))
+        elif name == "auto_export":
+            if output.get("ok"):
+                res = output.get("result", {})
+                self._latest_export_dir = res.get("target_dir")
+                files_str = "\n".join("  • " + os.path.basename(f) for f in res.get("saved_files", []))
+                self.append_message("Автоэкспорт", "Файлы сохранены в:\n{0}\n{1}".format(self._latest_export_dir, files_str))
+            else:
+                self.append_message("Автоэкспорт", "Ошибка: " + str(output.get("error", "неизвестная ошибка")))
         else:
             self.append_message("Результат: " + name,
                                 json.dumps(output.get("result"), ensure_ascii=False, indent=2))
@@ -283,6 +307,16 @@ class ChatWindow(QDialog):
         )
 
         self.input.setFocus()
+
+    def open_output_folder(self):
+        folder = self._latest_export_dir
+        if not folder or not os.path.exists(folder):
+            from .AutoExport import get_output_base_dir
+            folder = get_output_base_dir()
+        if os.path.exists(folder):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        else:
+            self.status.setText("Папка экспорта пока не создана.")
 
     def cancel_request(self):
         self._cancel_event.set()
