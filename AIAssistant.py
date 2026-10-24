@@ -42,6 +42,8 @@ class AIAssistant(Extension):
         self._web_event_lock = threading.Lock()
         self._web_request_lock = threading.Lock()
         self._latest_export_dir = None
+        self._web_models = {}
+        self._web_model_lock = threading.Lock()
 
         self._preferences = (
             Application.getInstance().getPreferences()
@@ -219,6 +221,41 @@ class AIAssistant(Extension):
         return self._settings_tools.on_main_thread(
             self._settings_tools.profile_snapshot
         )
+
+    def register_web_model(self, path, data):
+        # Keep recent uploads available after TemporaryDirectory is removed.
+        import os
+        with self._web_model_lock:
+            if sum(len(v) for v in self._web_models.values()) + len(data) > 50 * 1024 * 1024:
+                self._web_models.clear()
+            self._web_models[os.path.normcase(os.path.realpath(path))] = data
+
+    def get_web_model_stl(self, path):
+        import os
+        from .ProfileCard import scene_stl
+        if path == "FROM_SCENE":
+            return self._settings_tools.on_main_thread(
+                lambda: scene_stl(self._settings_tools._scene_tools))
+        if (not isinstance(path, str) or len(path) > 4096 or not os.path.isabs(path)
+                or path.startswith(("\\\\", "//")) or os.path.splitext(path)[1].lower() != ".stl"):
+            raise ValueError("Нужен локальный STL из вложений или текущей сцены.")
+        canonical = os.path.normcase(os.path.realpath(path))
+        with self._web_model_lock:
+            cached = self._web_models.get(canonical)
+        if cached is not None:
+            return cached
+        # A model-generated path cannot read arbitrary files from the computer.
+        allowed = self._settings_tools.on_main_thread(lambda: [
+            os.path.normcase(os.path.realpath(n.getMeshData().getFileName()))
+            for n in self._settings_tools._scene_tools.nodes()
+            if n.getMeshData().getFileName()])
+        if canonical not in allowed:
+            raise ValueError("Этот STL не прикреплён к чату и не загружен в сцену.")
+        with open(canonical, "rb") as source:
+            data = source.read(50 * 1024 * 1024 + 1)
+        if not data or len(data) > 50 * 1024 * 1024:
+            raise ValueError("STL пуст или превышает 50 МБ.")
+        return data
 
     def get_web_events(self, since):
         with self._web_event_lock:

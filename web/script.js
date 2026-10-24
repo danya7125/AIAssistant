@@ -10,15 +10,13 @@ const attachmentInput = document.getElementById('attachments');
 const attachmentList = document.getElementById('attachment-list');
 const activityList = document.getElementById('activity-list');
 const activityEmpty = document.getElementById('activity-empty');
-const slicingState = document.getElementById('slicing-state');
-const slicingStatusText = document.getElementById('slicing-status');
-const slicingProgress = document.getElementById('slicing-progress');
-const printTime = document.getElementById('print-time');
-const materialUsage = document.getElementById('material-usage');
 const detailsToggle = document.getElementById('details-toggle');
 const workspace = document.querySelector('.workspace');
 const clearChatButton = document.getElementById('clear-chat');
+const scrollBtn = document.getElementById('scroll-to-bottom');
 const CLEAR_MARKER_KEY = 'ai-assistant-web-cleared-tail';
+const LOCAL_HISTORY_KEY = 'ai-assistant-local-history';
+const IS_SENDING_KEY = 'ai-assistant-is-sending';
 
 const REQUEST_TIMEOUT_MS = 200000;
 const MAX_ATTACHMENTS = 8;
@@ -27,15 +25,54 @@ let selectedFiles = [];
 let isSending = false;
 let eventCursor = 0;
 let eventPolling = false;
+let pollTimer = null;
 let pendingProfileChanges = false;
 let profileCardSequence = 0;
 let lastAssistantMessageElement = null;
+
+const typingIndicator = document.createElement('div');
+typingIndicator.className = 'typing-indicator';
+typingIndicator.innerHTML = '<span></span><span></span><span></span>';
 
 try {
     localStorage.removeItem('ai-assistant-web-attachments');
 } catch (error) {
     statusText.textContent = 'Не удалось очистить старые метаданные вложений.';
 }
+
+// --- ЛОКАЛЬНАЯ ИСТОРИЯ ---
+function saveLocalMessage(role, content) {
+    try {
+        let history = JSON.parse(localStorage.getItem(LOCAL_HISTORY_KEY) || '[]');
+        history.push({ role, content, timestamp: Date.now() });
+        if (history.length > 50) history = history.slice(history.length - 50);
+        localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(history));
+    } catch (e) {}
+}
+
+function clearLocalHistory() {
+    try {
+        localStorage.removeItem(LOCAL_HISTORY_KEY);
+    } catch (e) {}
+}
+
+function maybeMojibake(s) {
+    for (let i = 0; i < s.length; i++) {
+        if (s.charCodeAt(i) > 0xFF) return false; 
+    }
+    return /[\u00C0-\u00FF]{2,}/.test(s) || s.includes('пїЅ');
+}
+
+function repairEncoding(content) {
+    if (!maybeMojibake(content)) return content;
+    try {
+        const bytes = Uint8Array.from(content, ch => ch.charCodeAt(0) & 0xFF);
+        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch (e) {
+        return content;
+    }
+}
+// ---------------------------
 
 detailsToggle.addEventListener('click', function () {
     const expanded = detailsToggle.getAttribute('aria-expanded') === 'true';
@@ -49,12 +86,8 @@ function getExtension(fileName) {
 }
 
 function formatFileSize(size) {
-    if (size < 1024) {
-        return size + ' Б';
-    }
-    if (size < 1024 * 1024) {
-        return Math.round(size / 1024) + ' КБ';
-    }
+    if (size < 1024) return size + ' Б';
+    if (size < 1024 * 1024) return Math.round(size / 1024) + ' КБ';
     return (size / (1024 * 1024)).toFixed(1) + ' МБ';
 }
 
@@ -62,29 +95,23 @@ function renderAttachments() {
     while (attachmentList.firstChild) {
         attachmentList.removeChild(attachmentList.firstChild);
     }
-
     selectedFiles.forEach(function (file, index) {
         const chip = document.createElement('span');
         chip.className = 'attachment-chip';
-
         const name = document.createElement('span');
         name.className = 'attachment-name';
         name.textContent = file.name;
-
         const size = document.createElement('span');
         size.className = 'attachment-size';
         size.textContent = formatFileSize(file.size);
-
         const removeButton = document.createElement('button');
         removeButton.className = 'remove-attachment';
         removeButton.type = 'button';
         removeButton.textContent = '×';
-        removeButton.setAttribute('aria-label', 'Удалить файл ' + file.name);
         removeButton.addEventListener('click', function () {
             selectedFiles.splice(index, 1);
             renderAttachments();
         });
-
         chip.appendChild(name);
         chip.appendChild(size);
         chip.appendChild(removeButton);
@@ -96,45 +123,106 @@ function appendInlineFormatting(container, text) {
     const tokenPattern = /(\*\*.+?\*\*|`[^`]+`|\*[^*]+\*)/g;
     let lastIndex = 0;
     let match;
-
     while ((match = tokenPattern.exec(text)) !== null) {
-        if (match.index > lastIndex) {
-            container.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
-        }
+        if (match.index > lastIndex) container.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
         const token = match[0];
-        const element = document.createElement(
-            token.slice(0, 2) === '**' ? 'strong' :
-                token.charAt(0) === '`' ? 'code' : 'em'
-        );
-        element.textContent = token.slice(token.charAt(0) === '`' ? 1 : token.slice(0, 2) === '**' ? 2 : 1,
-            token.charAt(0) === '`' ? -1 : token.slice(0, 2) === '**' ? -2 : -1);
+        let element, content;
+        if (token.startsWith('**')) {
+            element = document.createElement('strong');
+            content = token.slice(2, -2);
+        } else if (token.startsWith('`')) {
+            element = document.createElement('code');
+            content = token.slice(1, -1);
+        } else {
+            element = document.createElement('em');
+            content = token.slice(1, -1);
+        }
+        element.textContent = content;
         container.appendChild(element);
         lastIndex = tokenPattern.lastIndex;
     }
-
-    if (lastIndex < text.length) {
-        container.appendChild(document.createTextNode(text.slice(lastIndex)));
-    }
+    if (lastIndex < text.length) container.appendChild(document.createTextNode(text.slice(lastIndex)));
 }
 
-function formatAssistantMessage(container, text) {
+function formatAssistantMessage(container, text, animate = false) {
+    const trimmedText = text.trim();
+    if (trimmedText.startsWith('{') && trimmedText.endsWith('}') && trimmedText.includes('"action":')) {
+        const details = document.createElement('details');
+        details.className = 'assistant-details';
+        const summary = document.createElement('summary');
+        summary.textContent = 'Показать системные данные (JSON)';
+        const pre = document.createElement('pre');
+        pre.style.whiteSpace = 'pre-wrap';
+        pre.style.fontSize = '11px';
+        pre.style.color = '#777168';
+        pre.style.margin = '0';
+        pre.style.padding = '12px 18px';
+        pre.style.background = '#faf9f6';
+        pre.style.borderTop = '1px solid #e9e5df';
+        pre.textContent = text;
+        details.appendChild(summary);
+        details.appendChild(pre);
+        container.appendChild(details);
+        return;
+    }
+
     let list = null;
     let listType = '';
     let paragraph = [];
     const lines = text.split(/\r?\n/);
+    let totalDelay = 0;
 
-    function flushParagraph() {
-        if (!paragraph.length) {
+    function animateElement(el, baseText) {
+        if (!animate) {
+            el.textContent = baseText;
             return;
         }
-        const element = document.createElement('p');
-        paragraph.forEach(function (line, index) {
-            if (index) {
-                element.appendChild(document.createElement('br'));
+        el.textContent = '';
+        let i = 0;
+        const speed = 2;
+        const userWasAtBottom = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 150;
+        const interval = setInterval(() => {
+            if (i < baseText.length) {
+                el.textContent += baseText.charAt(i);
+                i++;
+                if (userWasAtBottom && i % 10 === 0) {
+                    messageList.scrollTo({ top: messageList.scrollHeight, behavior: 'smooth' });
+                }
+            } else {
+                clearInterval(interval);
             }
-            appendInlineFormatting(element, line);
-        });
-        container.appendChild(element);
+        }, speed);
+    }
+
+    function applyAnimation(el, originalText) {
+        if (!animate) return el;
+        el.style.opacity = '0';
+        el.style.transform = 'translateY(6px)';
+        el.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+        const delay = totalDelay;
+        totalDelay += (originalText.length * 2) + 20;
+        setTimeout(() => {
+            el.style.opacity = '1';
+            el.style.transform = 'translateY(0)';
+            animateElement(el, originalText);
+        }, delay);
+        return el;
+    }
+
+    function flushParagraph() {
+        if (!paragraph.length) return;
+        const element = document.createElement('p');
+        const rawText = paragraph.join('\n');
+        if (animate) {
+            element.textContent = '';
+            container.appendChild(applyAnimation(element, rawText));
+        } else {
+            paragraph.forEach(function (line, index) {
+                if (index) element.appendChild(document.createElement('br'));
+                appendInlineFormatting(element, line);
+            });
+            container.appendChild(element);
+        }
         paragraph = [];
     }
 
@@ -151,8 +239,7 @@ function formatAssistantMessage(container, text) {
     }
 
     function parseTableRow(line) {
-        return line.trim().replace(/^\|/, '').replace(/\|$/, '')
-            .split('|').map(function (cell) { return cell.trim(); });
+        return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(function (cell) { return cell.trim(); });
     }
 
     function appendTableCell(row, tag, value) {
@@ -169,21 +256,16 @@ function formatAssistantMessage(container, text) {
         table.className = 'assistant-table';
         const thead = document.createElement('thead');
         const headerRow = document.createElement('tr');
-        headerCells.forEach(function (cell) {
-            appendTableCell(headerRow, 'th', cell);
-        });
+        headerCells.forEach(function (cell) { appendTableCell(headerRow, 'th', cell); });
         thead.appendChild(headerRow);
         table.appendChild(thead);
-
         const tbody = document.createElement('tbody');
         let rowIndex = startIndex + 2;
         while (rowIndex < lines.length && lines[rowIndex].trim().indexOf('|') !== -1) {
             const cells = parseTableRow(lines[rowIndex]);
             if (cells.some(function (cell) { return cell !== ''; })) {
                 const row = document.createElement('tr');
-                headerCells.forEach(function (_, index) {
-                    appendTableCell(row, 'td', cells[index] || '');
-                });
+                headerCells.forEach(function (_, index) { appendTableCell(row, 'td', cells[index] || ''); });
                 tbody.appendChild(row);
             }
             rowIndex += 1;
@@ -192,6 +274,11 @@ function formatAssistantMessage(container, text) {
         const tableWrapper = document.createElement('div');
         tableWrapper.className = 'assistant-table-wrap';
         tableWrapper.appendChild(table);
+        if (animate) {
+            tableWrapper.style.opacity = '0';
+            setTimeout(() => { tableWrapper.style.opacity = '1'; tableWrapper.style.transition = 'opacity 0.3s'; }, totalDelay);
+            totalDelay += 300;
+        }
         container.appendChild(tableWrapper);
         return rowIndex - 1;
     }
@@ -215,37 +302,40 @@ function formatAssistantMessage(container, text) {
             flushParagraph();
             closeList();
             const headingElement = document.createElement('h3');
-            appendInlineFormatting(headingElement, heading[2]);
-            container.appendChild(headingElement);
+            headingElement.textContent = '';
+            if (animate) {
+                container.appendChild(applyAnimation(headingElement, heading[2]));
+            } else {
+                appendInlineFormatting(headingElement, heading[2]);
+                container.appendChild(headingElement);
+            }
             continue;
         }
         if (bullet || numbered) {
             flushParagraph();
             const nextListType = bullet ? 'ul' : 'ol';
-            if (list && listType !== nextListType) {
-                closeList();
-            }
+            if (list && listType !== nextListType) closeList();
             if (!list) {
                 list = document.createElement(nextListType);
                 listType = nextListType;
             }
             const item = document.createElement('li');
-            appendInlineFormatting(item, (bullet || numbered)[1]);
-            list.appendChild(item);
+            const textContent = (bullet || numbered)[1];
+            if (animate) {
+                item.textContent = '';
+                list.appendChild(applyAnimation(item, textContent));
+            } else {
+                appendInlineFormatting(item, textContent);
+                list.appendChild(item);
+            }
             continue;
         }
-
         closeList();
         paragraph.push(line);
     }
-
     flushParagraph();
     closeList();
 }
-
-/* ============================================================
-   Карточка профиля: данные от ИИ + 3D-превью загруженной модели
-   ============================================================ */
 
 const uploadedModels = new Map();
 let lastUploadedModels = [];
@@ -254,22 +344,14 @@ const MAX_VIEWERS = 6;
 const MAX_PREVIEW_TRIANGLES = 400000;
 
 const PARAM_ALIASES = {
-    nozzle: 'machine_nozzle_size',
-    nozzle_size: 'machine_nozzle_size',
-    nozzle_temp: 'material_print_temperature',
-    nozzle_temperature: 'material_print_temperature',
-    print_temperature: 'material_print_temperature',
-    bed_temp: 'material_bed_temperature',
-    bed_temperature: 'material_bed_temperature',
-    speed: 'speed_print',
-    print_speed: 'speed_print',
-    wall_speed: 'speed_wall',
-    outer_wall_speed: 'speed_wall',
-    first_layer_speed: 'speed_layer_0',
-    infill: 'infill_sparse_density',
-    infill_density: 'infill_sparse_density',
-    walls: 'wall_line_count',
-    perimeters: 'wall_line_count'
+    temp_nozzle: 'material_print_temperature', temp_bed: 'material_bed_temperature',
+    nozzle: 'machine_nozzle_size', nozzle_size: 'machine_nozzle_size',
+    nozzle_temp: 'material_print_temperature', nozzle_temperature: 'material_print_temperature',
+    print_temperature: 'material_print_temperature', bed_temp: 'material_bed_temperature',
+    bed_temperature: 'material_bed_temperature', speed: 'speed_print',
+    print_speed: 'speed_print', wall_speed: 'speed_wall', outer_wall_speed: 'speed_wall',
+    first_layer_speed: 'speed_layer_0', infill: 'infill_sparse_density',
+    infill_density: 'infill_sparse_density', walls: 'wall_line_count', perimeters: 'wall_line_count'
 };
 
 const PARAM_META = {
@@ -307,17 +389,23 @@ function tryParseJson(source) {
 }
 
 function normalizeCardObject(value) {
-    if (!value || typeof value !== 'object') {
-        return null;
-    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
     const card = value.card && typeof value.card === 'object' ? value.card : value;
-    const looksLikeCard = card.action === 'show_profile_card' || value.action === 'show_profile_card' ||
-        (card.params && typeof card.params === 'object') || Array.isArray(card.rows);
-    return looksLikeCard ? card : null;
+    if (card.action !== 'show_profile_card' || !card.params || Array.isArray(card.params) ||
+        typeof card.params !== 'object' || typeof card.text !== 'string' ||
+        (typeof card.model_path !== 'string' && card.model_path !== null)) return null;
+    if (!Object.keys(card.params).length || Object.values(card.params).some(function (v) {
+        return v !== null && !['number', 'string', 'boolean'].includes(typeof v);
+    })) return null;
+    return card;
 }
 
-/* Ищет в ответе ИИ команду карточки: [CARD]{...}[/CARD], блок ```json или чистый JSON. */
 function extractCard(text) {
+    if (text && typeof text === 'object') {
+        const card = normalizeCardObject(text);
+        return {card: card, rest: card ? card.text : JSON.stringify(text)};
+    }
+    text = String(text == null ? '' : text);
     const result = { card: null, rest: text };
 
     const tagged = /\[CARD\]([\s\S]*?)\[\/CARD\]/i.exec(text);
@@ -340,6 +428,17 @@ function extractCard(text) {
             return result;
         }
     }
+    
+    const jsonPattern = /\{[\s\S]*"action"\s*:\s*"show_profile_card"[\s\S]*\}/g;
+    const jsonMatch = jsonPattern.exec(text);
+    if (jsonMatch) {
+        const card = normalizeCardObject(tryParseJson(jsonMatch[0]));
+        if (card) {
+            result.card = card;
+            result.rest = text.replace(jsonMatch[0], '').trim();
+            return result;
+        }
+    }
 
     const trimmed = text.trim();
     if (trimmed.charAt(0) === '{' && trimmed.charAt(trimmed.length - 1) === '}') {
@@ -359,14 +458,10 @@ function shouldShowProfileCard(text, requestText, hasProfileChanges) {
 }
 
 function formatCardValue(value, unit) {
-    if (typeof value === 'boolean') {
-        return value ? 'Да' : 'Нет';
-    }
+    if (typeof value === 'boolean') return value ? 'Да' : 'Нет';
     if (typeof value === 'string') {
         const trimmed = value.trim();
-        if (!trimmed) {
-            return '—';
-        }
+        if (!trimmed) return '—';
         return /^-?\d+(?:[.,]\d+)?$/.test(trimmed) ? trimmed + unit : trimmed;
     }
     return formatProfileValue(value, unit);
@@ -378,28 +473,20 @@ function collectCardRows(data) {
         ? data.params : {};
     Object.keys(params).forEach(function (name) {
         const raw = params[name];
-        if (raw === null || raw === undefined || typeof raw === 'object') {
-            return;
-        }
+        if (raw === null || raw === undefined || typeof raw === 'object') return;
         const key = PARAM_ALIASES[name] || name;
         const meta = PARAM_META[key] || {};
         rows.push({
-            key: key,
-            raw: raw,
-            label: meta.label || name.replace(/_/g, ' '),
-            group: meta.group || 'Прочее',
-            value: formatCardValue(raw, meta.unit || '')
+            key: key, raw: raw, label: meta.label || name.replace(/_/g, ' '),
+            group: meta.group || 'Прочее', value: formatCardValue(raw, meta.unit || '')
         });
     });
     if (Array.isArray(data.rows)) {
         data.rows.forEach(function (row) {
             if (row && row.label !== undefined && row.label !== null) {
                 rows.push({
-                    key: null,
-                    raw: row.value,
-                    label: String(row.label),
-                    group: String(row.group || 'Прочее'),
-                    value: formatCardValue(row.value, row.unit || '')
+                    key: null, raw: row.value, label: String(row.label),
+                    group: String(row.group || 'Прочее'), value: formatCardValue(row.value, row.unit || '')
                 });
             }
         });
@@ -409,12 +496,8 @@ function collectCardRows(data) {
 
 function buildCardSettings(card, rows) {
     const container = card.querySelector('.profile-settings');
-    if (!container) {
-        return;
-    }
-    while (container.firstChild) {
-        container.removeChild(container.firstChild);
-    }
+    if (!container) return;
+    while (container.firstChild) container.removeChild(container.firstChild);
     if (!rows.length) {
         const empty = document.createElement('p');
         empty.className = 'empty-state';
@@ -424,9 +507,7 @@ function buildCardSettings(card, rows) {
     }
     const groups = new Map();
     rows.forEach(function (row) {
-        if (!groups.has(row.group)) {
-            groups.set(row.group, []);
-        }
+        if (!groups.has(row.group)) groups.set(row.group, []);
         groups.get(row.group).push(row);
     });
     const names = Array.from(groups.keys()).sort(function (a, b) {
@@ -465,15 +546,11 @@ function baseName(name) {
 function pickModelFile(name, files) {
     if (name) {
         const found = uploadedModels.get(baseName(name).toLowerCase());
-        if (found) {
-            return found;
-        }
+        if (found) return found;
     }
     const list = files && files.length ? files : lastUploadedModels;
     return list.length ? list[0] : null;
 }
-
-/* ---------- STL: разбор и подготовка сетки ---------- */
 
 function parseSTL(buffer) {
     const size = buffer.byteLength;
@@ -502,9 +579,7 @@ function parseSTL(buffer) {
         while ((match = pattern.exec(text)) !== null) {
             values.push(parseFloat(match[1]), parseFloat(match[2]), parseFloat(match[3]));
         }
-        if (values.length < 9 || values.length % 9) {
-            throw new Error('файл не похож на STL');
-        }
+        if (values.length < 9 || values.length % 9) throw new Error('файл не похож на STL');
         positions = Float32Array.from(values);
     }
     return positions;
@@ -517,9 +592,7 @@ function prepareMesh(source) {
     const positions = new Float32Array(kept * 9);
     let n = 0;
     for (let i = 0; i < triangles; i += stride) {
-        for (let k = 0; k < 9; k += 1) {
-            positions[n * 9 + k] = source[i * 9 + k];
-        }
+        for (let k = 0; k < 9; k += 1) positions[n * 9 + k] = source[i * 9 + k];
         n += 1;
     }
     triangles = n;
@@ -529,11 +602,9 @@ function prepareMesh(source) {
     for (let i = 0; i < triangles * 3; i += 1) {
         for (let a = 0; a < 3; a += 1) {
             const v = positions[i * 3 + a];
-            if (!Number.isFinite(v)) {
-                throw new Error('в модели есть нечисловые координаты');
-            }
-            if (v < min[a]) { min[a] = v; }
-            if (v > max[a]) { max[a] = v; }
+            if (!Number.isFinite(v)) throw new Error('в модели есть нечисловые координаты');
+            if (v < min[a]) min[a] = v;
+            if (v > max[a]) max[a] = v;
         }
     }
     const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
@@ -572,334 +643,125 @@ function prepareMesh(source) {
         }
     }
     return {
-        positions: positions,
-        normals: normals,
-        vertexCount: triangles * 3,
+        positions, normals, vertexCount: triangles * 3,
         size: { x: max[0] - min[0], y: max[1] - min[1], z: max[2] - min[2] }
     };
 }
-
-/* ---------- Минимальный WebGL-просмотрщик без внешних библиотек ---------- */
 
 function mat4Multiply(a, b) {
     const out = new Float32Array(16);
     for (let c = 0; c < 4; c += 1) {
         for (let r = 0; r < 4; r += 1) {
             let sum = 0;
-            for (let k = 0; k < 4; k += 1) {
-                sum += a[k * 4 + r] * b[c * 4 + k];
-            }
+            for (let k = 0; k < 4; k += 1) sum += a[k * 4 + r] * b[c * 4 + k];
             out[c * 4 + r] = sum;
         }
     }
     return out;
 }
-
 function mat4RotateX(angle) {
-    const c = Math.cos(angle);
-    const s = Math.sin(angle);
+    const c = Math.cos(angle), s = Math.sin(angle);
     return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
 }
-
 function mat4RotateY(angle) {
-    const c = Math.cos(angle);
-    const s = Math.sin(angle);
+    const c = Math.cos(angle), s = Math.sin(angle);
     return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
 }
-
 function mat4Perspective(fovy, aspect, near, far) {
     const f = 1 / Math.tan(fovy / 2);
     return new Float32Array([
-        f / aspect, 0, 0, 0,
-        0, f, 0, 0,
+        f / aspect, 0, 0, 0, 0, f, 0, 0,
         0, 0, (far + near) / (near - far), -1,
         0, 0, 2 * far * near / (near - far), 0
     ]);
 }
 
-function createModelViewer(canvas, mesh) {
-    const options = { antialias: true, alpha: true };
-    const gl = canvas.getContext('webgl', options) || canvas.getContext('experimental-webgl', options);
-    if (!gl) {
-        return null;
-    }
-
-    function compile(type, source) {
-        const shader = gl.createShader(type);
-        gl.shaderSource(shader, source);
-        gl.compileShader(shader);
-        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-            throw new Error(gl.getShaderInfoLog(shader) || 'ошибка шейдера');
-        }
-        return shader;
-    }
-
-    const program = gl.createProgram();
-    gl.attachShader(program, compile(gl.VERTEX_SHADER,
-        'attribute vec3 aPos;attribute vec3 aNorm;uniform mat4 uMVP;uniform mat4 uRot;varying vec3 vN;' +
-        'void main(){vN=(uRot*vec4(aNorm,0.0)).xyz;gl_Position=uMVP*vec4(aPos,1.0);}'));
-    gl.attachShader(program, compile(gl.FRAGMENT_SHADER,
-        'precision mediump float;varying vec3 vN;' +
-        'void main(){vec3 n=normalize(vN);' +
-        'float key=dot(n,normalize(vec3(-0.45,0.75,0.6)))*0.5+0.5;' +
-        'float fill=dot(n,normalize(vec3(0.7,-0.3,0.4)))*0.5+0.5;' +
-        'vec3 base=vec3(0.50,0.72,0.80);' +
-        'vec3 color=base*(0.32+0.62*key*key+0.18*fill);' +
-        'gl_FragColor=vec4(color,1.0);}'));
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        throw new Error('не удалось собрать шейдеры');
-    }
-    gl.useProgram(program);
-
-    function bindBuffer(data, name) {
-        const buffer = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-        gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
-        const location = gl.getAttribLocation(program, name);
-        gl.enableVertexAttribArray(location);
-        gl.vertexAttribPointer(location, 3, gl.FLOAT, false, 0, 0);
-        return buffer;
-    }
-    const positionBuffer = bindBuffer(mesh.positions, 'aPos');
-    const normalBuffer = bindBuffer(mesh.normals, 'aNorm');
-    const mvpLocation = gl.getUniformLocation(program, 'uMVP');
-    const rotLocation = gl.getUniformLocation(program, 'uRot');
-    gl.enable(gl.DEPTH_TEST);
-    gl.clearColor(0, 0, 0, 0);
-
-    const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const zUp = mat4RotateX(-Math.PI / 2);
-    let yaw = -0.6;
-    let pitch = 0.5;
-    let hovering = false;
-    let dragging = false;
-    let frame = 0;
-    let lastTime = 0;
-    let lastX = 0;
-    let lastY = 0;
-    let disposed = false;
-
-    function resize() {
-        const ratio = Math.min(window.devicePixelRatio || 1, 2);
-        const width = Math.round(canvas.clientWidth * ratio);
-        const height = Math.round(canvas.clientHeight * ratio);
-        if (width > 0 && height > 0 && (canvas.width !== width || canvas.height !== height)) {
-            canvas.width = width;
-            canvas.height = height;
-        }
-    }
-
-    function draw() {
-        if (disposed) {
-            return;
-        }
-        resize();
-        if (!canvas.width || !canvas.height) {
-            return;
-        }
-        gl.viewport(0, 0, canvas.width, canvas.height);
-        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        const aspect = canvas.width / canvas.height;
-        const distance = 3.9 / Math.min(1, aspect);
-        const rotation = mat4Multiply(mat4RotateX(pitch), mat4Multiply(mat4RotateY(yaw), zUp));
-        const move = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -distance, 1]);
-        const mvp = mat4Multiply(mat4Perspective(0.56, aspect, 0.1, 50),
-            mat4Multiply(move, rotation));
-        gl.uniformMatrix4fv(mvpLocation, false, mvp);
-        gl.uniformMatrix4fv(rotLocation, false, rotation);
-        gl.drawArrays(gl.TRIANGLES, 0, mesh.vertexCount);
-    }
-
-    function tick(time) {
-        frame = 0;
-        if (disposed) {
-            return;
-        }
-        const delta = lastTime ? Math.min(0.05, (time - lastTime) / 1000) : 0;
-        lastTime = time;
-        if (hovering && !dragging && !reduceMotion) {
-            yaw += delta * 0.9;
-        }
-        draw();
-        if (hovering || dragging) {
-            frame = requestAnimationFrame(tick);
-        } else {
-            lastTime = 0;
-        }
-    }
-
-    function start() {
-        if (!frame && !disposed) {
-            frame = requestAnimationFrame(tick);
-        }
-    }
-
-    function stopDrag() {
-        dragging = false;
-        canvas.classList.remove('is-grabbing');
-    }
-
-    canvas.addEventListener('pointerenter', function () { hovering = true; start(); });
-    canvas.addEventListener('pointerleave', function () { hovering = false; });
-    canvas.addEventListener('pointerdown', function (event) {
-        dragging = true;
-        lastX = event.clientX;
-        lastY = event.clientY;
-        canvas.classList.add('is-grabbing');
-        if (canvas.setPointerCapture) {
-            canvas.setPointerCapture(event.pointerId);
-        }
-        start();
-    });
-    canvas.addEventListener('pointermove', function (event) {
-        if (!dragging) {
-            return;
-        }
-        yaw += (event.clientX - lastX) * 0.01;
-        pitch = Math.max(-1.5, Math.min(1.5, pitch + (event.clientY - lastY) * 0.01));
-        lastX = event.clientX;
-        lastY = event.clientY;
-    });
-    canvas.addEventListener('pointerup', stopDrag);
-    canvas.addEventListener('pointercancel', stopDrag);
-    canvas.addEventListener('dblclick', function () {
-        yaw = -0.6;
-        pitch = 0.5;
-        draw();
-    });
-
-    let observer = null;
-    if (window.ResizeObserver) {
-        observer = new ResizeObserver(draw);
-        observer.observe(canvas);
-    }
-    draw();
-
-    return {
-        dispose: function () {
-            disposed = true;
-            if (frame) {
-                cancelAnimationFrame(frame);
-            }
-            if (observer) {
-                observer.disconnect();
-            }
-            gl.deleteBuffer(positionBuffer);
-            gl.deleteBuffer(normalBuffer);
-            const lose = gl.getExtension('WEBGL_lose_context');
-            if (lose) {
-                lose.loseContext();
-            }
-        }
-    };
-}
-
+let threeViewerModule;
 async function loadModelIntoCard(card, source) {
-    const stage = card.querySelector('.model-stage');
-    const canvas = card.querySelector('.model-canvas');
     const empty = card.querySelector('[data-model-empty]');
-    const sizeElement = card.querySelector('[data-model-size]');
-    if (!stage || !canvas || !empty) {
-        return;
-    }
     empty.hidden = false;
-    empty.textContent = 'Загрузка модели…';
+    empty.textContent = 'Загрузка 3D-модели…';
     try {
-        let buffer;
-        if (typeof source === 'string') {
-            if (source.charAt(0) !== '/') {
-                throw new Error('разрешены только пути на этом сервере');
-            }
-            const response = await fetch(source);
-            if (!response.ok) {
-                throw new Error('HTTP ' + response.status);
-            }
-            buffer = await response.arrayBuffer();
-        } else {
-            buffer = await source.arrayBuffer();
-        }
-        const mesh = prepareMesh(parseSTL(buffer));
-        if (!card.isConnected) {
-            return;
-        }
-        const viewer = createModelViewer(canvas, mesh);
-        if (!viewer) {
-            empty.textContent = 'WebGL недоступен: 3D-превью не показано.';
-            return;
-        }
+        if (!threeViewerModule) threeViewerModule = import('./model-viewer.js').catch(function(error) {
+            threeViewerModule = null;
+            throw error;
+        });
+        const module = await threeViewerModule;
+        const viewer = await module.mountModel(card, source);
+        if (!viewer) return;
         activeViewers.push(viewer);
-        while (activeViewers.length > MAX_VIEWERS) {
-            activeViewers.shift().dispose();
-        }
-        stage.classList.add('has-model');
-        empty.hidden = true;
-        if (sizeElement) {
-            sizeElement.textContent = 'Размеры: ' + [mesh.size.x, mesh.size.y, mesh.size.z]
-                .map(function (v) { return formatProfileValue(v, ''); }).join(' × ') + ' мм';
-        }
+        while (activeViewers.length > MAX_VIEWERS) activeViewers.shift().dispose();
     } catch (error) {
+        if (!card.isConnected) return;
         empty.hidden = false;
-        empty.textContent = 'Не удалось показать модель: ' + error.message;
+        empty.textContent = '3D-превью недоступно: ' + error.message;
     }
 }
-
-/* ---------- Сборка карточки ---------- */
 
 function fillProposalCard(card, data, rows) {
     const eyebrow = card.querySelector('[data-profile-eyebrow]');
-    if (eyebrow) {
-        eyebrow.textContent = String(data.eyebrow || 'Рекомендованный профиль').toUpperCase();
-    }
+    if (eyebrow) eyebrow.textContent = String(data.eyebrow || 'Рекомендованный профиль').toUpperCase();
     const title = card.querySelector('[data-profile-title]');
-    if (title) {
-        title.textContent = data.title || 'Стартовый профиль';
-    }
+    if (title) title.textContent = data.title || 'Стартовый профиль';
     const modelName = card.querySelector('[data-model-name]');
     const rawName = data.model_name || data.model || data.name || '';
-    if (modelName) {
-        modelName.textContent = rawName ? baseName(rawName).replace(/\.stl$/i, '') : 'Модель';
-    }
+    if (modelName) modelName.textContent = rawName ? baseName(rawName).replace(/\.stl$/i, '') : 'Модель';
     const note = card.querySelector('[data-model-note]');
     if (note && data.conditions) {
         note.textContent = String(data.conditions);
         note.hidden = false;
     }
     const warning = card.querySelector('[data-profile-note]');
-    if (warning) {
-        warning.textContent = data.warning || 'Предварительный профиль: требует калибровки перед печатью.';
+    if (warning) warning.textContent = data.warning || 'Предварительный профиль: требует калибровки перед печатью.';
+    if (data.applied === true) {
+        if (eyebrow) eyebrow.textContent = 'ПРИМЕНЁННЫЙ ПРОФИЛЬ';
+        if (warning) warning.textContent = 'Параметры подтверждены чтением из слайсера. Превью — модель, не траектории G-code.';
     }
     buildCardSettings(card, rows);
 }
 
 function setupApplyButton(card, data, rows) {
     const button = card.querySelector('.apply-profile-button');
-    if (!button) {
+    if (!button) return;
+    if (data.applied === true) {
+        button.textContent = 'Применено в слайсере';
+        button.disabled = true;
         return;
     }
-    const lines = rows.filter(function (row) { return row.key; })
+    button.title = 'Передать эти параметры помощнику для проверки и применения в слайсере';
+    const lines = rows.filter(function (row) { return row.key && row.key !== 'machine_nozzle_size'; })
         .map(function (row) { return row.key + ' = ' + row.raw; });
     if (!lines.length) {
         button.hidden = true;
         return;
     }
+    
     button.addEventListener('click', function () {
+        // Если уже что-то отправляется — прерываем клик
         if (isSending) {
             statusText.textContent = 'Дождитесь завершения текущего запроса.';
             return;
         }
+        
+        // Меняем текст кнопки, чтобы было видно, что клик сработал
+        button.textContent = 'Отправка...';
+        
         submitMessage(
-            'Применить профиль «' + (data.title || 'стартовый профиль') + '» в слайсере:\n' +
-            lines.join('\n') + '\nПрименяй материал и параметры печати как указано.',
+            'Без нарезки. Применить профиль «' + (data.title || 'стартовый профиль') + '» в слайсере:\n' +
+            lines.join('\n') + '\nПрименяй материал и параметры печати как указано. ' +
+            'Диаметр сопла в карточке — справочное требование: ' + String(data.params.nozzle || 'не указан') +
+            '. Проверь соответствие установленному соплу; аппаратные параметры не меняй.',
             []
         );
     });
 }
 
+function renderProfileCard(data, messageElement, modelFile) {
+    return appendProfileCard(messageElement, data, modelFile);
+}
+
 function appendProfileCard(messageElement, cardData, modelFile) {
-    if (!profileCardTemplate || !profileCardTemplate.content.firstElementChild) {
-        return null;
-    }
+    if (!profileCardTemplate || !profileCardTemplate.content.firstElementChild) return null;
     const card = profileCardTemplate.content.firstElementChild.cloneNode(true);
     profileCardSequence += 1;
     const ids = new Map();
@@ -920,29 +782,23 @@ function appendProfileCard(messageElement, cardData, modelFile) {
     });
 
     const file = modelFile === undefined ? pickModelFile(null, null) : modelFile;
-    let source = file || null;
+    let source = '/api/model_stl?path=' + encodeURIComponent(cardData && cardData.model_path || 'FROM_SCENE');
 
     if (cardData) {
         const rows = collectCardRows(cardData);
         card.dataset.live = 'false';
         fillProposalCard(card, cardData, rows);
         setupApplyButton(card, cardData, rows);
-        if (!source && typeof cardData.model_url === 'string') {
-            source = cardData.model_url;
-        }
+        if (!source && typeof cardData.model_url === 'string') source = cardData.model_url;
     } else {
         card.dataset.live = 'true';
         const applyButton = card.querySelector('.apply-profile-button');
-        if (applyButton) {
-            applyButton.hidden = true;
-        }
+        if (applyButton) applyButton.hidden = true;
         const warning = card.querySelector('[data-profile-note]');
-        if (warning) {
-            warning.textContent = 'Текущие значения из слайсера.';
-        }
+        if (warning) warning.textContent = 'Текущие значения из слайсера.';
     }
 
-    if (file) {
+    if (file && cardData && cardData.model_path !== 'FROM_SCENE') {
         card.dataset.localModel = 'true';
         const name = card.querySelector('[data-model-name]');
         if (name && (!cardData || !name.textContent || name.textContent === 'Модель')) {
@@ -959,14 +815,8 @@ function appendProfileCard(messageElement, cardData, modelFile) {
     } else {
         messageElement.appendChild(container);
     }
-    if (!cardData) {
-        // «Живая» карточка появится, только когда слайсер вернёт данные.
-        container.hidden = true;
-    }
-
-    if (source) {
-        loadModelIntoCard(card, source);
-    }
+    if (!cardData) container.hidden = true;
+    if (source) loadModelIntoCard(card, source);
     return card;
 }
 
@@ -986,13 +836,28 @@ function addMessage(author, text, type, attachments, requestText, hasProfileChan
     if (type === 'assistant') {
         const parsed = extractCard(text);
         cardData = parsed.card;
-        const bodyText = parsed.rest;
+        const bodyText = parsed.card ? [parsed.card.text, parsed.rest].filter(Boolean).filter(function(v, i, a) { return a.indexOf(v) === i; }).join('\n\n') : parsed.rest;
         wantsLiveCard = !cardData && shouldShowProfileCard(text, requestText || '', hasProfileChanges);
 
         if (!bodyText.trim()) {
             bodyElement.hidden = true;
         } else {
-            formatAssistantMessage(bodyElement, bodyText);
+            const shouldAnimate = bodyText.length < 2000;
+            if (bodyText.length > 2000) {
+                bodyElement.classList.add('is-collapsible');
+                const details = document.createElement('details');
+                details.className = 'assistant-details';
+                const summary = document.createElement('summary');
+                summary.textContent = 'Показать полный текст от ИИ';
+                const detailsBody = document.createElement('div');
+                detailsBody.className = 'assistant-details-body';
+                formatAssistantMessage(detailsBody, bodyText, false);
+                details.appendChild(summary);
+                details.appendChild(detailsBody);
+                bodyElement.appendChild(details);
+            } else {
+                formatAssistantMessage(bodyElement, bodyText, shouldAnimate);
+            }
         }
     } else {
         bodyElement.textContent = text;
@@ -1004,59 +869,70 @@ function addMessage(author, text, type, attachments, requestText, hasProfileChan
     if (attachments && attachments.length) {
         const attachmentContainer = document.createElement('div');
         attachmentContainer.className = 'message-attachments';
-
         attachments.forEach(function (file) {
             const attachment = document.createElement('div');
             attachment.className = 'message-attachment';
-
             const icon = document.createElement('span');
             icon.className = 'message-attachment-icon';
-            icon.setAttribute('aria-hidden', 'true');
             icon.textContent = getExtension(file.name).toUpperCase();
-
             const details = document.createElement('span');
             details.className = 'message-attachment-details';
-
             const name = document.createElement('strong');
             name.className = 'message-attachment-name';
             name.textContent = file.name;
-
             const size = document.createElement('small');
             size.className = 'message-attachment-size';
             size.textContent = formatFileSize(file.size);
-
             details.appendChild(name);
             details.appendChild(size);
             attachment.appendChild(icon);
             attachment.appendChild(details);
             attachmentContainer.appendChild(attachment);
         });
-
-        const disclaimer = document.createElement('span');
-        disclaimer.className = 'attachment-disclaimer';
-        disclaimer.textContent = 'Вложение будет передано локальному помощнику для этого запроса.';
-
         messageElement.appendChild(attachmentContainer);
-        messageElement.appendChild(disclaimer);
+        messageElement.appendChild(document.createElement('span')).className = 'attachment-disclaimer';
+    }
+
+    const actionsTemplate = document.getElementById('message-actions-template');
+    if (actionsTemplate) {
+        const actions = actionsTemplate.content.firstElementChild.cloneNode(true);
+        const timeSpan = actions.querySelector('.message-time');
+        if (timeSpan) {
+            const now = new Date();
+            timeSpan.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+        const copyBtn = actions.querySelector('.copy-message-btn');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', function () {
+                let textToCopy = text;
+                if (cardData && cardData.text) textToCopy = cardData.text;
+                navigator.clipboard.writeText(textToCopy).then(() => {
+                    copyBtn.style.color = '#21b981';
+                    setTimeout(() => { copyBtn.style.color = ''; }, 1500);
+                });
+            });
+        }
+        messageElement.appendChild(actions);
     }
 
     messageList.appendChild(messageElement);
 
     if (cardData) {
         const nameHint = cardData.model_name || cardData.model || cardData.name;
-        appendProfileCard(messageElement, cardData, pickModelFile(nameHint, modelFiles));
+        renderProfileCard(cardData, messageElement, pickModelFile(nameHint, modelFiles));
     } else if (wantsLiveCard) {
         appendProfileCard(messageElement, null, pickModelFile(null, modelFiles));
     }
 
-    if (type === 'assistant') {
-        lastAssistantMessageElement = messageElement;
-    }
-    if (type === 'assistant' && (cardData || wantsLiveCard)) {
-        // Ответ высокий: показываем его с начала, а не с конца.
-        messageList.scrollTop = Math.max(0, messageElement.offsetTop - messageList.offsetTop - 12);
-    } else {
-        messageList.scrollTop = messageList.scrollHeight;
+    if (type === 'assistant') lastAssistantMessageElement = messageElement;
+    
+    const isNearBottom = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 150;
+    if (type === 'user' || (type === 'assistant' && isNearBottom)) {
+        if (cardData || wantsLiveCard) {
+            messageList.scrollTo({ top: Math.max(0, messageElement.offsetTop - messageList.offsetTop - 12), behavior: 'smooth' });
+        } else {
+            messageList.scrollTo({ top: messageList.scrollHeight, behavior: 'smooth' });
+        }
     }
     return messageElement;
 }
@@ -1068,9 +944,7 @@ function finalizeLiveCard(card) {
         const value = row.querySelector('dd');
         const empty = !value || value.textContent.trim() === '—';
         row.hidden = empty;
-        if (!empty) {
-            visibleRows += 1;
-        }
+        if (!empty) visibleRows += 1;
     });
     card.querySelectorAll('.parameter-group').forEach(function (group) {
         group.hidden = !group.querySelector('.parameter-row:not([hidden])');
@@ -1081,34 +955,22 @@ function finalizeLiveCard(card) {
         note.className = 'empty-state profile-empty';
         note.textContent = 'Параметры слайсера пока недоступны.';
         const settings = card.querySelector('.profile-settings');
-        if (settings) {
-            settings.appendChild(note);
-        }
+        if (settings) settings.appendChild(note);
     }
     note.hidden = visibleRows > 0;
     const hasModel = card.dataset.localModel === 'true';
-    if (container) {
-        container.hidden = !(visibleRows > 0 || hasModel);
-    }
+    if (container) container.hidden = !(visibleRows > 0 || hasModel);
 }
 
 function addActivity(eventData) {
-    if (!eventData || typeof eventData !== 'object') {
-        return;
-    }
-
+    if (!eventData || typeof eventData !== 'object') return;
     const toolName = eventData.tool || eventData.name || eventData.type || 'Инструмент';
     const toolLabels = {
-        get_print_context: 'Контекст слайсера',
-        get_print_settings: 'Текущие параметры',
-        get_scene_models: 'Модели на столе',
-        set_material: 'Материал',
-        set_print_settings: 'Изменение параметров',
-        load_model: 'Загрузка модели',
-        orient_model: 'Ориентация модели',
-        arrange_models: 'Расстановка моделей',
-        validate_geometry: 'Проверка геометрии',
-        start_slicing: 'Слайсинг'
+        get_print_context: 'Контекст слайсера', get_print_settings: 'Текущие параметры',
+        get_scene_models: 'Модели на столе', set_material: 'Материал',
+        set_print_settings: 'Изменение параметров', load_model: 'Загрузка модели',
+        orient_model: 'Ориентация модели', arrange_models: 'Расстановка моделей',
+        validate_geometry: 'Проверка геометрии', start_slicing: 'Слайсинг'
     };
     const displayName = toolLabels[toolName] || toolName;
     const status = eventData.status ? ' · ' + eventData.status : '';
@@ -1116,14 +978,10 @@ function addActivity(eventData) {
 
     const item = document.createElement('li');
     item.className = 'activity-item';
-
     const title = document.createElement('div');
     title.className = 'activity-title';
-
     const bullet = document.createElement('span');
     bullet.className = 'activity-bullet';
-    bullet.setAttribute('aria-hidden', 'true');
-
     const label = document.createElement('span');
     label.textContent = String(displayName) + status;
     title.appendChild(bullet);
@@ -1135,17 +993,11 @@ function addActivity(eventData) {
             const changes = document.createElement('div');
             changes.className = 'activity-changes';
             const settingLabels = {
-                material: 'Материал',
-                machine_nozzle_size: 'Сопло',
-                material_print_temperature: 'Температура сопла',
-                material_bed_temperature: 'Температура стола',
-                layer_height: 'Высота слоя',
-                speed_print: 'Скорость печати',
-                speed_wall: 'Скорость внешней стенки',
-                speed_layer_0: 'Скорость первого слоя',
-                infill_sparse_density: 'Заполнение',
-                wall_line_count: 'Периметры',
-                loaded_model: 'Загружена модель'
+                material: 'Материал', machine_nozzle_size: 'Сопло',
+                material_print_temperature: 'Температура сопла', material_bed_temperature: 'Температура стола',
+                layer_height: 'Высота слоя', speed_print: 'Скорость печати',
+                speed_wall: 'Скорость внешней стенки', speed_layer_0: 'Скорость первого слоя',
+                infill_sparse_density: 'Заполнение', wall_line_count: 'Периметры', loaded_model: 'Загружена модель'
             };
             result.changes.forEach(function (change) {
                 const row = document.createElement('p');
@@ -1155,31 +1007,38 @@ function addActivity(eventData) {
                 key.textContent = settingLabels[change.key] || change.key;
                 const value = document.createElement('span');
                 value.className = 'activity-change-value';
-                value.textContent = formatProfileValue(change.before, '') + ' → ' +
-                    formatProfileValue(change.after, '');
-                row.appendChild(key);
-                row.appendChild(value);
-                changes.appendChild(row);
+                value.textContent = formatProfileValue(change.before, '') + ' → ' + formatProfileValue(change.after, '');
+                row.appendChild(key); row.appendChild(value); changes.appendChild(row);
             });
             item.appendChild(changes);
         } else {
-            const resultElement = document.createElement('p');
-            resultElement.className = 'activity-result';
-            resultElement.textContent = typeof result === 'string'
-                ? result
-                : JSON.stringify(result);
-            item.appendChild(resultElement);
+            const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+            if (resultText.length > 80 || resultText.includes('{')) {
+                const details = document.createElement('details');
+                details.className = 'activity-details';
+                const summary = document.createElement('summary');
+                summary.textContent = 'Технические данные';
+                const resultElement = document.createElement('p');
+                resultElement.className = 'activity-result';
+                resultElement.textContent = resultText;
+                details.appendChild(summary); details.appendChild(resultElement); item.appendChild(details);
+            } else {
+                const resultElement = document.createElement('p');
+                resultElement.className = 'activity-result';
+                resultElement.textContent = resultText;
+                item.appendChild(resultElement);
+            }
         }
     }
 
     activityList.appendChild(item);
     activityEmpty.hidden = true;
+    const sideScrollArea = document.querySelector('.side-scroll-area');
+    if (sideScrollArea) sideScrollArea.scrollTo({ top: sideScrollArea.scrollHeight, behavior: 'smooth' });
 }
 
 function formatProfileValue(value, unit) {
-    if (value === null || value === undefined || value === '') {
-        return '—';
-    }
+    if (value === null || value === undefined || value === '') return '—';
     if (typeof value === 'number' && Number.isFinite(value)) {
         value = Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
     } else {
@@ -1189,123 +1048,64 @@ function formatProfileValue(value, unit) {
 }
 
 function refreshProfile(changedKeys) {
-    return fetch('/api/profile')
-        .then(function (response) {
-            if (!response.ok) {
-                throw new Error('HTTP ' + response.status);
+    return fetch('/api/profile').then(function (response) {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return response.json();
+    }).then(function (profile) {
+        const context = profile.context || {};
+        const settings = profile.settings || {};
+        const mode = settings.printing_mode === 'classic' ? 'FDM' : settings.printing_mode;
+        const model = context.models && context.models.length ? context.models[0] : null;
+
+        document.querySelectorAll('.slice-profile[data-live="true"]').forEach(function (profileCard) {
+            const title = profileCard.querySelector('[data-profile-title]');
+            if (title) title.textContent = (mode ? mode + ' · ' : '') + (context.profile || context.printer && context.printer.name || 'Активные настройки');
+            const material = profileCard.querySelector('[data-profile-material]');
+            if (material) {
+                material.textContent = context.material || '—';
+                if (changedKeys && changedKeys.indexOf('material') !== -1) {
+                    material.classList.remove('is-updated');
+                    void material.offsetWidth;
+                    material.classList.add('is-updated');
+                    setTimeout(function () { material.classList.remove('is-updated'); }, 1800);
+                }
             }
-            return response.json();
-        })
-        .then(function (profile) {
-            const context = profile.context || {};
-            const settings = profile.settings || {};
-            const mode = settings.printing_mode === 'classic' ? 'FDM' : settings.printing_mode;
-            const model = context.models && context.models.length ? context.models[0] : null;
-
-            document.querySelectorAll('.slice-profile[data-live="true"]').forEach(function (profileCard) {
-                const title = profileCard.querySelector('[data-profile-title]');
-                if (title) {
-                    title.textContent = (mode ? mode + ' · ' : '') +
-                        (context.profile || context.printer && context.printer.name || 'Активные настройки');
+            const modelName = profileCard.querySelector('[data-model-name]');
+            const modelSize = profileCard.querySelector('[data-model-size]');
+            const localModel = profileCard.dataset.localModel === 'true';
+            if (modelName && !localModel) modelName.textContent = model ? model.name : 'Модель не загружена';
+            if (modelSize && !localModel) {
+                const size = model && model.size_mm;
+                modelSize.textContent = size ? 'Размеры: ' + ['x', 'y', 'z'].map(function (axis) {
+                    return formatProfileValue(size[axis], ' мм');
+                }).join(' × ') : 'Размеры появятся после загрузки модели';
+            }
+            const materialCell = profileCard.querySelector('[data-profile-material]');
+            if (materialCell && materialCell.textContent.trim() === '') materialCell.textContent = '—';
+            profileCard.querySelectorAll('[data-setting]').forEach(function (element) {
+                const key = element.getAttribute('data-setting');
+                if (Object.prototype.hasOwnProperty.call(settings, key)) {
+                    element.textContent = formatProfileValue(settings[key], element.getAttribute('data-unit') || '');
+                } else {
+                    element.textContent = '—';
                 }
-
-                const material = profileCard.querySelector('[data-profile-material]');
-                if (material) {
-                    material.textContent = context.material || '—';
-                    if (changedKeys && changedKeys.indexOf('material') !== -1) {
-                        material.classList.remove('is-updated');
-                        void material.offsetWidth;
-                        material.classList.add('is-updated');
-                        setTimeout(function () {
-                            material.classList.remove('is-updated');
-                        }, 1800);
-                    }
+                if (changedKeys && changedKeys.indexOf(key) !== -1) {
+                    element.classList.remove('is-updated');
+                    void element.offsetWidth;
+                    element.classList.add('is-updated');
+                    setTimeout(function () { element.classList.remove('is-updated'); }, 1800);
                 }
-
-                const modelName = profileCard.querySelector('[data-model-name]');
-                const modelSize = profileCard.querySelector('[data-model-size]');
-                const localModel = profileCard.dataset.localModel === 'true';
-                if (modelName && !localModel) {
-                    modelName.textContent = model ? model.name : 'Модель не загружена';
-                }
-                if (modelSize && !localModel) {
-                    const size = model && model.size_mm;
-                    modelSize.textContent = size
-                        ? 'Размеры: ' + ['x', 'y', 'z'].map(function (axis) {
-                            return formatProfileValue(size[axis], ' мм');
-                        }).join(' × ')
-                        : 'Размеры появятся после загрузки модели';
-                }
-
-                const materialCell = profileCard.querySelector('[data-profile-material]');
-                if (materialCell && materialCell.textContent.trim() === '') {
-                    materialCell.textContent = '—';
-                }
-                profileCard.querySelectorAll('[data-setting]').forEach(function (element) {
-                    const key = element.getAttribute('data-setting');
-                    if (Object.prototype.hasOwnProperty.call(settings, key)) {
-                        element.textContent = formatProfileValue(
-                            settings[key],
-                            element.getAttribute('data-unit') || ''
-                        );
-                    } else {
-                        element.textContent = '—';
-                    }
-                    if (changedKeys && changedKeys.indexOf(key) !== -1) {
-                        element.classList.remove('is-updated');
-                        void element.offsetWidth;
-                        element.classList.add('is-updated');
-                        setTimeout(function () {
-                            element.classList.remove('is-updated');
-                        }, 1800);
-                    }
-                });
-                finalizeLiveCard(profileCard);
             });
-        })
-        .catch(function (error) {
-            document.querySelectorAll('.slice-profile[data-live="true"]').forEach(finalizeLiveCard);
-            statusText.textContent = 'Профиль слайсера недоступен (' + error.message + '). Карточки с данными ИИ работают без него.';
+            finalizeLiveCard(profileCard);
         });
-}
-
-function updateSlicing(data) {
-    if (!data || typeof data !== 'object') {
-        return;
-    }
-    const status = typeof data.status === 'string' ? data.status : '';
-    slicingStatusText.textContent = status || 'Слайсинг обновлён';
-    slicingState.classList.remove('is-active', 'is-complete', 'is-error');
-
-    const normalizedStatus = status.toLowerCase();
-    if (/error|ошиб/.test(normalizedStatus)) {
-        slicingState.classList.add('is-error');
-    } else if (/done|complete|готов|заверш/.test(normalizedStatus)) {
-        slicingState.classList.add('is-complete');
-    } else if (/start|progress|slice|выполн|подготов|слайс/.test(normalizedStatus)) {
-        slicingState.classList.add('is-active');
-    }
-
-    const progress = data.progress_percent !== undefined
-        ? Number(data.progress_percent)
-        : Number(data.progress) * (Number(data.progress) <= 1 ? 100 : 1);
-    if (Number.isFinite(progress)) {
-        slicingProgress.value = Math.max(0, Math.min(100, progress));
-    }
-
-    if (data.print_time !== undefined && data.print_time !== null) {
-        printTime.textContent = String(data.print_time);
-    }
-    if (data.material !== undefined && data.material !== null) {
-        materialUsage.textContent = String(data.material);
-    }
+    }).catch(function (error) {
+        document.querySelectorAll('.slice-profile[data-live="true"]').forEach(finalizeLiveCard);
+        statusText.textContent = 'Профиль слайсера недоступен (' + error.message + '). Карточки с данными ИИ работают без него.';
+    });
 }
 
 function displayAgentEvents(events) {
-    if (!Array.isArray(events)) {
-        return;
-    }
-
+    if (!Array.isArray(events)) return;
     events.forEach(function (entry) {
         if (entry && Number.isFinite(Number(entry.id))) {
             eventCursor = Math.max(eventCursor, Number(entry.id));
@@ -1315,56 +1115,25 @@ function displayAgentEvents(events) {
 }
 
 function handleAgentEvent(eventData) {
-    if (!eventData || typeof eventData !== 'object') {
-        return;
-    }
-
+    if (!eventData || typeof eventData !== 'object') return;
     if (eventData.phase === 'status') {
         const message = eventData.message || 'Обработка запроса…';
         statusText.textContent = message;
-        const slicingProgressMatch = /^Нарезка:\s*([\d.]+)%/.exec(message);
-        if (slicingProgressMatch) {
-            updateSlicing({
-                status: 'processing',
-                progress_percent: Number(slicingProgressMatch[1])
-            });
-        }
         return;
     }
-
     if (eventData.phase === 'start') {
-        addActivity({
-            name: eventData.name || 'Инструмент',
-            status: 'выполняется',
-            result: eventData.arguments || ''
-        });
+        addActivity({ name: eventData.name || 'Инструмент', status: 'выполняется', result: eventData.arguments || '' });
         return;
     }
-
     if (eventData.phase === 'result') {
         const output = eventData.output || {};
         const result = output.ok ? output.result : output.error;
-        addActivity({
-            name: eventData.name || 'Инструмент',
-            status: output.ok ? 'готово' : 'ошибка',
-            result: result || 'Нет данных о результате.'
-        });
-
-        if (eventData.name === 'start_slicing' && output.result) {
-            updateSlicing(output.result);
-        }
-        if (output.ok && [
-            'set_material',
-            'set_print_settings',
-            'load_model',
-            'orient_model',
-            'arrange_models'
-        ].indexOf(eventData.name) !== -1) {
+        addActivity({ name: eventData.name || 'Инструмент', status: output.ok ? 'готово' : 'ошибка', result: result || 'Нет данных о результате.' });
+        
+        if (output.ok && ['set_material', 'set_print_settings', 'load_model', 'orient_model', 'arrange_models'].indexOf(eventData.name) !== -1) {
             pendingProfileChanges = true;
             const changes = output.result && output.result.changes;
-            const changedKeys = Array.isArray(changes)
-                ? changes.map(function (change) { return change.key; })
-                : [];
+            const changedKeys = Array.isArray(changes) ? changes.map(function (change) { return change.key; }) : [];
             refreshProfile(changedKeys).then(function () {
                 if (lastAssistantMessageElement && !lastAssistantMessageElement.querySelector('.slice-profile')) {
                     appendProfileCard(lastAssistantMessageElement);
@@ -1376,19 +1145,14 @@ function handleAgentEvent(eventData) {
 }
 
 async function pollAgentEvents() {
-    if (!eventPolling) {
-        return;
-    }
-
+    if (!eventPolling) return;
     try {
         const response = await fetch('/api/events?since=' + eventCursor);
-        if (!response.ok) {
-            throw new Error('HTTP ' + response.status);
-        }
+        if (!response.ok) throw new Error('HTTP ' + response.status);
         const data = await response.json();
         displayAgentEvents(data.events);
-        if (Number.isFinite(Number(data.next_id))) {
-            eventCursor = Math.max(eventCursor, Number(data.next_id));
+        if (data.event_cursor != null && Number.isFinite(Number(data.event_cursor))) {
+            eventCursor = Math.max(eventCursor, Number(data.event_cursor));
         }
     } catch (error) {
         statusText.textContent = 'Нет соединения с сервером STE Slicer.';
@@ -1396,23 +1160,13 @@ async function pollAgentEvents() {
 }
 
 function readClearMarker() {
-    try {
-        return localStorage.getItem(CLEAR_MARKER_KEY);
-    } catch (error) {
-        return null;
-    }
+    try { return localStorage.getItem(CLEAR_MARKER_KEY); } catch (error) { return null; }
 }
-
 function writeClearMarker(value) {
     try {
-        if (value === null) {
-            localStorage.removeItem(CLEAR_MARKER_KEY);
-        } else {
-            localStorage.setItem(CLEAR_MARKER_KEY, value);
-        }
-    } catch (error) {
-        /* без localStorage чат просто покажет историю заново */
-    }
+        if (value === null) localStorage.removeItem(CLEAR_MARKER_KEY);
+        else localStorage.setItem(CLEAR_MARKER_KEY, value);
+    } catch (error) {}
 }
 
 async function clearChat() {
@@ -1420,32 +1174,25 @@ async function clearChat() {
         statusText.textContent = 'Дождитесь ответа, затем очистите чат.';
         return;
     }
+    clearLocalHistory();
+    localStorage.removeItem(IS_SENDING_KEY);
+
     try {
         const response = await fetch('/api/history');
         if (response.ok) {
             const data = await response.json();
             const list = Array.isArray(data.messages) ? data.messages : [];
-            writeClearMarker(list.length ? JSON.stringify({
-                role: list[list.length - 1].role,
-                content: list[list.length - 1].content,
-                count: list.length
-            }) : null);
+            writeClearMarker(list.length ? JSON.stringify({ role: list[list.length - 1].role, content: list[list.length - 1].content, count: list.length }) : null);
         }
-    } catch (error) {
-        /* сервер недоступен: очищаем только экран */
-    }
+    } catch (error) {}
     activeViewers.splice(0).forEach(function (viewer) { viewer.dispose(); });
     uploadedModels.clear();
     lastUploadedModels = [];
     lastAssistantMessageElement = null;
     Array.prototype.slice.call(messageList.children).forEach(function (child) {
-        if (child !== profileCardTemplate) {
-            messageList.removeChild(child);
-        }
+        if (child !== profileCardTemplate) messageList.removeChild(child);
     });
-    while (activityList.firstChild) {
-        activityList.removeChild(activityList.firstChild);
-    }
+    while (activityList.firstChild) activityList.removeChild(activityList.firstChild);
     activityEmpty.hidden = false;
     selectedFiles = [];
     renderAttachments();
@@ -1453,245 +1200,210 @@ async function clearChat() {
     messageInput.focus();
 }
 
-if (clearChatButton) {
-    clearChatButton.addEventListener('click', clearChat);
-}
+if (clearChatButton) clearChatButton.addEventListener('click', clearChat);
 
 async function loadConversation() {
+    // 1. Принудительно сбрасываем зависший статус при загрузке
+    localStorage.removeItem(IS_SENDING_KEY);
+    isSending = false;
+    sendButton.disabled = false;
+    sendButton.style.opacity = '1';
+    if (scrollBtn) scrollBtn.classList.remove('is-loading');
+
+    // 2. Загружаем локальную историю (там наши сообщения в нормальной кодировке)
+    let localMessages = [];
+    try {
+        localMessages = JSON.parse(localStorage.getItem(LOCAL_HISTORY_KEY) || '[]');
+    } catch (e) {}
+
+    // 3. Рендерим только локальную историю
+    let lastUserText = '';
+    localMessages.forEach(function (msg) {
+        const type = msg.role === 'user' ? 'user' : 'assistant';
+        let content = msg.content; // Локально всё нормально
+        
+        if (type === 'user') {
+            lastUserText = content;
+            lastAssistantMessageElement = null;
+            addMessage('Вы', content, type);
+        } else {
+            let cardData = null;
+            if (content.startsWith('{') && content.includes('show_profile_card')) {
+                try { cardData = JSON.parse(content); } catch(e) {}
+            }
+            addMessage('Помощник', cardData || content, type, null, lastUserText, shouldShowProfileCard(content, lastUserText, false));
+        }
+    });
+
+    // 4. Скролл вниз
+    requestAnimationFrame(() => {
+        messageList.scrollTo({ top: messageList.scrollHeight, behavior: 'smooth' });
+    });
+
+    // 5. Синхронизация с сервером (только для курсора событий и профиля)
     try {
         const response = await fetch('/api/history');
-        if (!response.ok) {
-            throw new Error('HTTP ' + response.status);
-        }
-        const data = await response.json();
-        if (Array.isArray(data.messages)) {
-            let visibleMessages = data.messages;
-            const markerText = readClearMarker();
-            if (markerText) {
-                const marker = tryParseJson(markerText);
-                if (marker) {
-                    for (let i = data.messages.length - 1; i >= 0; i -= 1) {
-                        const item = data.messages[i];
-                        if (item && item.role === marker.role && item.content === marker.content) {
-                            visibleMessages = data.messages.slice(i + 1);
-                            break;
-                        }
-                    }
-                }
+        if (response.ok) {
+            const data = await response.json();
+            if (data.event_cursor != null && Number.isFinite(Number(data.event_cursor))) {
+                eventCursor = Number(data.event_cursor);
             }
-            let lastUserText = '';
-            visibleMessages.forEach(function (message) {
-                if (!message || typeof message.content !== 'string') {
-                    return;
-                }
-                const author = message.role === 'user' ? 'Вы' : 'Помощник';
-                const type = message.role === 'user' ? 'user' : 'assistant';
-                if (type === 'user') {
-                    lastUserText = message.content;
-                    lastAssistantMessageElement = null;
-                    addMessage(author, message.content, type);
-                } else {
-                    addMessage(
-                        author,
-                        message.content,
-                        type,
-                        null,
-                        lastUserText,
-                        shouldShowProfileCard(message.content, lastUserText, false)
-                    );
-                }
-            });
-        }
-        if (Number.isFinite(Number(data.event_cursor))) {
-            eventCursor = Number(data.event_cursor);
         }
         statusText.textContent = 'Подключено к STE Slicer.';
         refreshProfile();
     } catch (error) {
-        statusText.textContent = 'Не удалось подключиться к серверу STE Slicer.';
+        statusText.textContent = 'Сервер STE Slicer недоступен.';
     }
 
     eventPolling = true;
     pollAgentEvents();
-    setInterval(pollAgentEvents, 500);
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollAgentEvents, 500);
 }
 
 async function submitMessage(messageText, messageAttachments) {
-    if (isSending) {
-        return;
-    }
-    messageAttachments = messageAttachments || [];
-    messageAttachments.forEach(function (file) {
-        uploadedModels.set(baseName(file.name).toLowerCase(), file);
-    });
-    if (messageAttachments.length) {
-        lastUploadedModels = messageAttachments.slice();
-    }
-
+    if (isSending) return;
     isSending = true;
+    
+    // Жестко блокируем отправку
+    sendButton.disabled = true;
+    sendButton.style.opacity = '0.5';
+    messageInput.disabled = true;
+    
+    // Блокируем все кнопки "Применить" на экране
+    document.querySelectorAll('.apply-profile-button').forEach(btn => btn.disabled = true);
+
+    localStorage.setItem(IS_SENDING_KEY, 'true');
+    
     pendingProfileChanges = false;
     lastAssistantMessageElement = null;
-    sendButton.disabled = true;
+    saveLocalMessage('user', messageText);
+
     const userMessage = addMessage('Вы', messageText, 'user', messageAttachments);
     messageInput.value = '';
     selectedFiles = [];
     attachmentInput.value = '';
     renderAttachments();
-    statusText.textContent = 'Ожидаем ответ…';
+    
+    statusText.textContent = 'ИИ думает и выполняет действия…';
+    messageList.appendChild(typingIndicator);
+    messageList.scrollTo({ top: messageList.scrollHeight, behavior: 'smooth' });
+
+    if (scrollBtn) scrollBtn.classList.add('is-loading');
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(function () {
-        controller.abort();
-    }, REQUEST_TIMEOUT_MS);
+    const timeoutId = setTimeout(function () { controller.abort(); }, REQUEST_TIMEOUT_MS);
 
     try {
         eventPolling = true;
         const requestBody = new FormData();
         requestBody.append('text', messageText);
-        messageAttachments.forEach(function (file) {
-            requestBody.append('attachments', file, file.name);
-        });
-        const response = await fetch('/api/message', {
-            method: 'POST',
-            body: requestBody,
-            signal: controller.signal
-        });
-
+        messageAttachments.forEach(function (file) { requestBody.append('attachments', file, file.name); });
+        
+        const response = await fetch('/api/message', { method: 'POST', body: requestBody, signal: controller.signal });
+        
         if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || 'HTTP ' + response.status);
+            if (response.status === 409) {
+                throw new Error('Сервер уже занят обработкой другого запроса. Подождите.');
+            }
+            throw new Error('Ошибка сервера ' + response.status);
+        }
+        
+        const buffer = await response.arrayBuffer();
+        const text = new TextDecoder('utf-8').decode(buffer);
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch (e) {
+            throw new Error('Поврежденный ответ от сервера');
         }
 
-        const data = await response.json();
-        if (typeof data.reply !== 'string') {
-            throw new Error('В ответе нет поля reply');
+        let replyText = data.reply || '';
+        let cardData = data.card;
+        if (!cardData && typeof replyText === 'string' && replyText.includes('"show_profile_card"')) {
+            const parsed = extractCard(replyText);
+            if (parsed.card) {
+                cardData = parsed.card;
+                replyText = parsed.rest;
+            }
         }
+        
+        saveLocalMessage('assistant', cardData ? JSON.stringify(cardData) : replyText);
 
-        addMessage(
-            'Помощник',
-            data.reply,
-            'assistant',
-            null,
-            messageText,
-            pendingProfileChanges || messageAttachments.length > 0,
-            messageAttachments
-        );
+        addMessage('Помощник', cardData || replyText, 'assistant', null, messageText, pendingProfileChanges || messageAttachments.length > 0, messageAttachments);
         const attachmentDisclaimer = userMessage.querySelector('.attachment-disclaimer');
-        if (attachmentDisclaimer) {
-            attachmentDisclaimer.textContent = 'Отправлено локальному помощнику; исходник не хранится.';
-        }
-        refreshProfile();
+        if (attachmentDisclaimer) attachmentDisclaimer.textContent = 'Отправлено локальному помощнику; исходник не хранится.';
         statusText.textContent = 'Ответ получен.';
-
     } catch (error) {
-        const errorText = error.name === 'AbortError'
-            ? 'Сервер не ответил за ' + REQUEST_TIMEOUT_MS / 1000 + ' секунд.'
-            : error.message;
-
+        const errorText = error.name === 'AbortError' ? 'Сервер не ответил вовремя.' : error.message;
         addMessage('Ошибка', errorText, 'error');
-        const attachmentDisclaimer = userMessage.querySelector('.attachment-disclaimer');
-        if (attachmentDisclaimer) {
-            attachmentDisclaimer.textContent = 'Не удалось отправить. Прикрепите файл повторно.';
-        }
-        statusText.textContent =
-            'Проверьте, что STE Slicer запущен и чат открыт через меню плагина.';
-
+        statusText.textContent = 'Ошибка отправки.';
     } finally {
         clearTimeout(timeoutId);
         isSending = false;
+        
+        // Снимаем ВСЕ блокировки
         sendButton.disabled = false;
+        sendButton.style.opacity = '1';
+        messageInput.disabled = false;
+        
+        document.querySelectorAll('.apply-profile-button').forEach(btn => btn.disabled = false);
+        
+        localStorage.removeItem(IS_SENDING_KEY);
+        if (typingIndicator.parentNode) typingIndicator.parentNode.removeChild(typingIndicator);
+        if (scrollBtn) scrollBtn.classList.remove('is-loading');
         messageInput.focus();
     }
 }
 
 function sendMessage(event) {
     event.preventDefault();
-
     const typedText = messageInput.value.trim();
-    if ((!typedText && !selectedFiles.length) || isSending) {
-        return;
-    }
+    if ((!typedText && !selectedFiles.length) || isSending) return;
     const messageAttachments = selectedFiles.slice();
-    const messageText = typedText || 'Прикреплённые файлы: ' +
-        messageAttachments.map(function (file) {
-            return file.name;
-        }).join(', ');
+    const messageText = typedText || 'Прикреплённые файлы: ' + messageAttachments.map(function (file) { return file.name; }).join(', ');
     return submitMessage(messageText, messageAttachments);
 }
 
 attachmentInput.addEventListener('change', function () {
     const rejectedFiles = [];
     const acceptedFiles = [];
-
     Array.prototype.forEach.call(attachmentInput.files, function (file) {
-        if (ALLOWED_EXTENSIONS.indexOf(getExtension(file.name)) === -1) {
-            rejectedFiles.push(file.name);
-        } else {
-            acceptedFiles.push(file);
-        }
+        if (ALLOWED_EXTENSIONS.indexOf(getExtension(file.name)) === -1) rejectedFiles.push(file.name);
+        else acceptedFiles.push(file);
     });
-
-    const existingFiles = new Set(selectedFiles.map(function (file) {
-        return file.name + ':' + file.size + ':' + file.lastModified;
-    }));
+    const existingFiles = new Set(selectedFiles.map(function (file) { return file.name + ':' + file.size + ':' + file.lastModified; }));
     const uniqueFiles = acceptedFiles.filter(function (file) {
         const key = file.name + ':' + file.size + ':' + file.lastModified;
-        if (existingFiles.has(key)) {
-            return false;
-        }
+        if (existingFiles.has(key)) return false;
         existingFiles.add(key);
         return true;
     });
     const availableSlots = MAX_ATTACHMENTS - selectedFiles.length;
     selectedFiles = selectedFiles.concat(uniqueFiles.slice(0, availableSlots));
     renderAttachments();
-
-    if (rejectedFiles.length) {
-        statusText.textContent = 'Принимаются только файлы STL. Не поддерживаются: ' +
-            rejectedFiles.join(', ');
-    } else if (uniqueFiles.length > availableSlots) {
-        statusText.textContent = 'Можно прикрепить не более ' + MAX_ATTACHMENTS + ' файлов.';
-    } else if (uniqueFiles.length) {
-        statusText.textContent = 'Файлы прикреплены к сообщению.';
-    }
-
+    if (rejectedFiles.length) statusText.textContent = 'Принимаются только файлы STL. Не поддерживаются: ' + rejectedFiles.join(', ');
+    else if (uniqueFiles.length > availableSlots) statusText.textContent = 'Можно прикрепить не более ' + MAX_ATTACHMENTS + ' файлов.';
+    else if (uniqueFiles.length) statusText.textContent = 'Файлы прикреплены к сообщению.';
     attachmentInput.value = '';
 });
 
-chatForm.addEventListener('dragover', function (event) {
-    event.preventDefault();
-    chatForm.classList.add('is-dragging');
-});
-
-chatForm.addEventListener('dragleave', function (event) {
-    if (!chatForm.contains(event.relatedTarget)) {
-        chatForm.classList.remove('is-dragging');
-    }
-});
-
+chatForm.addEventListener('dragover', function (event) { event.preventDefault(); chatForm.classList.add('is-dragging'); });
+chatForm.addEventListener('dragleave', function (event) { if (!chatForm.contains(event.relatedTarget)) chatForm.classList.remove('is-dragging'); });
 chatForm.addEventListener('drop', function (event) {
     event.preventDefault();
     chatForm.classList.remove('is-dragging');
-
     const droppedFiles = Array.prototype.slice.call(event.dataTransfer.files);
     const transfer = new DataTransfer();
-    droppedFiles.forEach(function (file) {
-        transfer.items.add(file);
-    });
-
+    droppedFiles.forEach(function (file) { transfer.items.add(file); });
     const previousFiles = selectedFiles.slice();
     attachmentInput.files = transfer.files;
     attachmentInput.dispatchEvent(new Event('change'));
-    const newlyAdded = selectedFiles.filter(function (file) {
-        return previousFiles.indexOf(file) === -1;
-    });
-    if (newlyAdded.length) {
-        statusText.textContent = 'Файлы прикреплены к сообщению.';
-    }
+    const newlyAdded = selectedFiles.filter(function (file) { return previousFiles.indexOf(file) === -1; });
+    if (newlyAdded.length) statusText.textContent = 'Файлы прикреплены к сообщению.';
 });
 
 chatForm.addEventListener('submit', sendMessage);
-
 messageInput.addEventListener('keydown', function (event) {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
@@ -1708,11 +1420,23 @@ if (openFolderBtn) {
     openFolderBtn.addEventListener('click', async function () {
         try {
             const resp = await fetch('/api/open-folder');
-            if (!resp.ok) {
-                alert('Папка с экспортом пока не создана.');
-            }
-        } catch (e) {
-            console.error(e);
+            if (!resp.ok) alert('Папка с экспортом пока не создана.');
+        } catch (e) { console.error(e); }
+    });
+}
+
+// --- ЛОГИКА КНОПКИ "ВНИЗ" ---
+if (scrollBtn) {
+    messageList.addEventListener('scroll', function () {
+        const isScrolledUp = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight > 200;
+        if (isScrolledUp) {
+            scrollBtn.classList.add('is-visible');
+        } else {
+            scrollBtn.classList.remove('is-visible');
         }
+    });
+
+    scrollBtn.addEventListener('click', function () {
+        messageList.scrollTo({ top: messageList.scrollHeight, behavior: 'smooth' });
     });
 }

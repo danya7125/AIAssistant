@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>AI Assistant — STE Slicer</title>
-    <link rel="stylesheet" href="style.css?v=20261024-card-3d-2">
+    <link rel="stylesheet" href="style.css?v=profile-card-6">
 </head>
 <body>
     <div class="app-shell">
@@ -130,6 +130,12 @@
                     </template>
                 </div>
 
+                <button id="scroll-to-bottom" class="scroll-to-bottom" title="Вниз">
+                    <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="6 9 12 15 18 9"></polyline>
+                    </svg>
+                </button>
+
                 <p id="status" class="status-text" role="status">Готов к работе</p>
                 <form id="chat" class="composer">
                     <div id="attachment-list" class="attachment-list" aria-live="polite"></div>
@@ -149,7 +155,7 @@
                                 id="attachments"
                                 class="visually-hidden"
                                 type="file"
-                                accept=".stl"
+                                accept=".stl,.jpg,.jpeg,.png"
                                 multiple
                                 aria-label="Выбрать STL-модель"
                             >
@@ -173,40 +179,25 @@
                     <circle cx="13" cy="10" r="1.5"></circle>
                     <circle cx="8" cy="15" r="1.5"></circle>
                 </svg>
-                <span>Действия и слайсинг</span>
+                <span>Действия и экспорт</span>
                 <svg class="details-chevron" viewBox="0 0 20 20" aria-hidden="true">
                     <path d="m6 8 4 4 4-4"></path>
                 </svg>
             </button>
 
             <aside id="side-panel" class="side-panel" aria-label="Состояние работы">
-                <section class="side-card" aria-labelledby="activity-title">
-                    <div class="side-card-heading">
-                        <h2 id="activity-title">Действия помощника</h2>
-                    </div>
-                    <div id="activity-empty" class="empty-state">Здесь будут показаны действия и результаты.</div>
-                    <ol id="activity-list" class="activity-list" aria-live="polite"></ol>
-                </section>
+                <div class="side-scroll-area">
+                    <section class="side-card" aria-labelledby="activity-title">
+                        <div class="side-card-heading">
+                            <h2 id="activity-title">Действия помощника</h2>
+                        </div>
+                        <div id="activity-empty" class="empty-state">Здесь будут показаны действия и результаты.</div>
+                        <ol id="activity-list" class="activity-list" aria-live="polite"></ol>
+                    </section>
+                </div>
 
-                <section class="side-card slicing-card" aria-labelledby="slicing-title">
-                    <div class="side-card-heading">
-                        <h2 id="slicing-title">Слайсинг</h2>
-                    </div>
-                    <div id="slicing-state" class="slicing-status">
-                        <span class="status-indicator" aria-hidden="true"></span>
-                        <span id="slicing-status">Ожидание</span>
-                    </div>
-                    <progress id="slicing-progress" max="100" value="0" aria-label="Прогресс слайсинга"></progress>
-                    <div class="slice-metrics">
-                        <div>
-                            <span>Время печати</span>
-                            <strong id="print-time">—</strong>
-                        </div>
-                        <div>
-                            <span>Материал</span>
-                            <strong id="material-usage">—</strong>
-                        </div>
-                    </div>
+                <!-- Блок слайсинга удален, оставлена только кнопка -->
+                <section class="side-card slicing-card" style="border-top: 1px solid var(--line); border-bottom: 0; box-shadow: 0 -4px 12px rgba(0,0,0,0.03);">
                     <button id="open-folder-btn" class="open-folder-button" type="button">
                         <span>📂</span>
                         <span>Открыть папку экспорта</span>
@@ -215,6 +206,25 @@
             </aside>
         </main>
     </div>
-    <script src="script.js?v=20261024-card-3d-2"></script>
+
+    <template id="message-actions-template">
+        <div class="message-actions">
+            <span class="message-time"></span>
+            <button class="copy-message-btn" title="Скопировать текст">
+                <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+            </button>
+        </div>
+    </template>
+
+    <script type="importmap">
+    {"imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"
+    }}
+    </script>
+    <script src="script.js?v=profile-card-6"></script>
 </body>
 </html>

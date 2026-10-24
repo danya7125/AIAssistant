@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import uuid
+from .ProfileCard import parse_card
 from email import policy
 from email.parser import BytesParser
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -21,6 +22,46 @@ else:
     WEB_DIR = os.path.abspath(
         os.path.join(os.path.dirname(__file__), os.pardir, "web")
     )
+
+
+def setting_schema():
+    return {"type": "function", "function": {
+        "name": "set_setting",
+        "description": "Изменить один параметр печати в активном профиле/экструдере. Настоящий key из list_print_settings. Материал выбирать через set_material. printing_mode и аппаратные параметры запрещены.",
+        "parameters": {"type": "object", "properties": {
+            "key": {"type": "string", "description": "Например material_print_temperature, infill_sparse_density, speed_print, layer_height"},
+            "value": {"type": "string", "description": "Значение без единиц: 260, 0.2, true; для enum точный ключ варианта"}
+        }, "required": ["key", "value"], "additionalProperties": False}}}
+
+
+def dispatch_setting(settings_tools, arguments, cancel_event=None, deadline=None):
+    """Internal LLM dispatcher, not an unrestricted public HTTP write endpoint."""
+    if not isinstance(arguments, dict) or set(arguments) != {'key', 'value'}:
+        raise ValueError('set_setting требует ровно key и value.')
+    key, value = arguments['key'], arguments['value']
+    if not isinstance(key, str) or not key or len(key) > 200:
+        raise ValueError('key должен быть настоящим именем параметра слайсера.')
+    if key == 'printing_mode' or key.startswith('machine_'):
+        raise ValueError('Режим печати и аппаратные параметры меняются только вручную.')
+    if key in ('material', 'material_id'):
+        raise ValueError('Для выбора профиля материала используйте set_material(material_id=...).')
+    if not isinstance(value, str) or len(value) > 1000:
+        raise ValueError('value должен быть строкой без единиц измерения.')
+    # on_main_thread schedules app.callLater(execute), waits for completion,
+    # and cancels the queued callback if the request expires before execution.
+    # write selects the correct global/extruder stack, validates types/ranges,
+    # reads the actual value back, and rolls back if validation fails.
+    result = settings_tools.on_main_thread(
+        lambda: settings_tools.write({key: value}), cancel_event=cancel_event, deadline=deadline)
+    if not isinstance(result, dict) or result.get('skipped'):
+        raise ValueError('Слайсер не подтвердил изменение параметра.')
+    change = next((c for c in result.get('changes', []) if c.get('key') == key), None)
+    if change is None:
+        raise ValueError('Слайсер не вернул проверенное значение параметра ' + key)
+    result = dict(result)
+    result['status'] = 'success'
+    result['message'] = 'Параметр {0} установлен: {1}'.format(key, change['after'])
+    return result
 
 
 class ChatServer(ThreadingMixIn, HTTPServer):
@@ -66,6 +107,33 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         assistant = self.server.assistant
+
+        if path.startswith('/api/') and not self._local_request():
+            self.send_json(403, {"error": "Запрос разрешён только из локального интерфейса."})
+            return
+
+        if path == "/api/model_stl":
+            query = parse_qs(urlsplit(self.path).query)
+            model_path = query.get("path", ["FROM_SCENE"])[0]
+            try:
+                body = assistant.get_web_model_stl(model_path)
+            except (ValueError, OSError, RuntimeError) as error:
+                self.send_json(400, {"error": str(error)})
+                return
+            except Exception:
+                self.send_json(500, {"error": "Не удалось экспортировать модель из сцены."})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "model/stl")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Model-Up-Axis", "Y" if model_path == "FROM_SCENE" else "Z")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
 
         if path == "/api/history":
             self.send_json(200, {
@@ -123,6 +191,9 @@ class Handler(SimpleHTTPRequestHandler):
         SimpleHTTPRequestHandler.do_GET(self)
 
     def do_POST(self):
+        if not self._local_request():
+            self.send_json(403, {"error": "Запрос разрешён только из локального интерфейса."})
+            return
         if urlsplit(self.path).path != "/api/message":
             self.send_json(404, {"error": "Неизвестный адрес."})
             return
@@ -170,6 +241,7 @@ class Handler(SimpleHTTPRequestHandler):
                         saved_path = os.path.join(upload_dir, uuid.uuid4().hex + extension)
                         with open(saved_path, "wb") as uploaded_file:
                             uploaded_file.write(attachment["content"])
+                        self.server.assistant.register_web_model(saved_path, attachment["content"])
                         uploaded_files.append({
                             "name": attachment["name"],
                             "path": saved_path
@@ -190,7 +262,17 @@ class Handler(SimpleHTTPRequestHandler):
             })
             return
 
-        self.send_json(200, {"reply": reply})
+        # Preserve the original text for legacy clients; structured data for the web UI.
+        card = parse_card(reply)
+        self.send_json(200, {"reply": reply, "card": card})
+
+    def _local_request(self):
+        # No CORS; also reject DNS rebinding and foreign-page form submissions.
+        host = self.headers.get('Host', '')
+        allowed = {'127.0.0.1:' + str(self.server.server_port),
+                   'localhost:' + str(self.server.server_port)}
+        origin = self.headers.get('Origin')
+        return host in allowed and (origin is None or origin == 'http://' + host)
 
     @staticmethod
     def _parse_multipart(content_type, body):

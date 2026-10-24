@@ -1,4 +1,4 @@
-﻿import copy
+import copy
 import http.client
 import ast
 import json
@@ -8,7 +8,8 @@ import re
 import ssl
 import threading
 import time
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from .WebServer import setting_schema, dispatch_setting
 from urllib.error import HTTPError, URLError
 
 
@@ -16,7 +17,7 @@ class AgentClient:
     RETRY_DELAYS = (2, 5)
     MAX_STEPS = 12
     TASK_TIMEOUT = 1800
-    REQUEST_TIMEOUT = 600
+    REQUEST_TIMEOUT = 120
 
     def __init__(self, settings_tools):
         self.tools = settings_tools
@@ -38,25 +39,37 @@ class AgentClient:
                 payload['tools'] = self.tools.schemas(include_diagnostics=include_diagnostics)
             except TypeError:
                 payload['tools'] = self.tools.schemas()
+            payload['tools'] = [t for t in payload['tools'] if t.get('function', {}).get('name') != 'set_setting'] + [setting_schema()]
             payload['tool_choice'] = 'auto'
 
         body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8')
-        request = Request(
-            config['url'].rstrip('/') + '/chat/completions',
-            data=body,
-            headers={
-                'Authorization': 'Bearer ' + config['key'],
-                'Content-Type': 'application/json'
-            },
-            method='POST'
-        )
+        endpoint = urlsplit(config['url'].rstrip('/') + '/chat/completions')
+        if endpoint.scheme != 'https' or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+            raise ValueError('Нужен HTTPS URL API без логина, query и fragment.')
+        headers = {
+            'Authorization': 'Bearer ' + config['key'],
+            'Content-Type': 'application/json',
+            'Connection': 'keep-alive'
+        }
         context = ssl.create_default_context()
         ca_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cacert.pem')
         if os.path.isfile(ca_file):
             context.load_verify_locations(cafile=ca_file)
         try:
-            with urlopen(request, timeout=timeout, context=context) as response:
+            # urllib.request forces Connection: close internally. HTTPSConnection
+            # preserves our header; each attempt owns and closes its own socket.
+            connection = http.client.HTTPSConnection(endpoint.hostname, endpoint.port or 443,
+                timeout=min(self.REQUEST_TIMEOUT, timeout), context=context)
+            try:
+                connection.request('POST', endpoint.path or '/', body=body, headers=headers)
+                response = connection.getresponse()
                 raw = response.read(1024 * 1024 + 1)
+                if response.status >= 400:
+                    raise HTTPError(config['url'], response.status, response.reason, response.headers, None)
+                if response.status != 200:
+                    raise RuntimeError('API вернул неожиданный HTTP-статус {0}. Перенаправления не выполняются.'.format(response.status))
+            finally:
+                connection.close()
             if len(raw) > 1024 * 1024:
                 raise ValueError('Ответ API слишком большой.')
             result = json.loads(raw.decode('utf-8'))
@@ -120,8 +133,12 @@ class AgentClient:
         temporary = False
         while isinstance(current, BaseException) and id(current) not in seen:
             seen.add(id(current))
-            if isinstance(current, ssl.SSLError):
-                return False  # Certificate/protocol errors need diagnosis, not retries.
+            if isinstance(current, ssl.SSLEOFError) or (
+                    isinstance(current, ssl.SSLError) and getattr(current, 'reason', '') in
+                    ('UNEXPECTED_EOF_WHILE_READING', 'EOF_OCCURRED_IN_VIOLATION_OF_PROTOCOL')):
+                temporary = True
+            elif isinstance(current, ssl.SSLError):
+                return False  # Never retry invalid certificates or disable verification.
             if isinstance(current, HTTPError):
                 return current.code in (502,503,504)
             if isinstance(current, (ConnectionResetError, ConnectionAbortedError,
@@ -182,6 +199,12 @@ class AgentClient:
                 raise value
             return value
 
+    def _profile_card(self, text):
+        # Values come from STE Slicer, never from a guessed LLM report.
+        from .ProfileCard import card_from_snapshot
+        snapshot = self.tools.on_main_thread(self.tools.profile_snapshot)
+        return json.dumps(card_from_snapshot(snapshot, text), ensure_ascii=False)
+
     def _summary(self, changes, slicing, reason=None):
         lines = [reason] if reason else []
         if changes:
@@ -209,7 +232,14 @@ class AgentClient:
                 lines.append(slicing['error'])
         else:
             lines.append('Нарезка в этом запросе не запускалась.')
-        return '\n'.join(lines)
+        text = '\n'.join(lines)
+        if not reason and (changes or slicing) and (not slicing or slicing.get('status') == 'completed'):
+            try:
+                return self._profile_card(text)
+            except Exception:
+                # A missing snapshot must not hide the outcome of the operation.
+                pass
+        return text
 
     @staticmethod
     def _clean_text(text):
@@ -228,6 +258,8 @@ class AgentClient:
     @staticmethod
     def _classify_intent(text, task_text=None, has_models=True):
         t = (text or '').strip().lower()
+        # The card's Apply request forbids hardware edits, not all parameter edits.
+        t = re.sub(r'аппаратные параметры не меняй[.!;]?', '', t)
         readonly = re.search(r'не\s+(?:меня\w*|изменя\w*|применя\w*|трогай)|ничего\s+не|только\s+(?:оцени\w*|покажи\w*|объясни\w*|сравни\w*)', t)
         diagnostic = re.search(r'провер\w*\s+(?:геометр\w*|сетк\w*|модел\w*|g-?code|траектор\w*)', t)
         if readonly:
@@ -337,8 +369,37 @@ class AgentClient:
 1. Вызови get_scene_models и analyse_orientation для 3D.
 2. Проверь базовую плоскость.
 3. Если вариантов несколько — спроси пользователя. Если вариант один — примени set_material(material_id="...").
-4. Примени технологический пакет: set_print_settings(values={...}).
-5. Запусти start_slicing().'''
+4. Примени каждый параметр отдельным вызовом set_setting(key=..., value=...). В одном ответе можно вызвать до 8 инструментов.
+5. Запусти start_slicing().
+
+ОБЯЗАТЕЛЬНОЕ ПРИМЕНЕНИЕ ПРОФИЛЯ:
+Когда пользователь просит применить профиль, ты ОБЯЗАН вызвать set_setting для
+каждого параметра, который нужно изменить. Не просто пиши текст: вызывай функции.
+Используй реальные ключи из list_print_settings, value передавай строкой без единиц
+(например "260", "0.2", "100", "true"). Температура — material_print_temperature,
+стол — material_bed_temperature, скорость — speed_print, заполнение — infill_sparse_density.
+Название материала НЕ является параметром: выбирай существующий профиль через
+set_material с точным material_id из list_materials; затем применяй настройки.
+printing_mode ЗАПРЕЩЕНО менять как через set_setting, так и через set_print_settings.
+Если необходим переход 3D/5D, попроси пользователя сделать его вручную.
+Не меняй machine_nozzle_size и другие аппаратные параметры.
+Только после успешных ответов всех функций сформируй итоговый JSON карточки.
+Если инструмент вернул ошибку, исправь её или сообщи, какие действия не завершены.
+JSON не заменяет вызовы инструментов и не подтверждает успешное применение.
+
+ФОРМАТ ИТОГОВОГО ПРОФИЛЯ:
+Когда параметры подобраны, верни один JSON-объект без Markdown и без ограждения ```:
+{"action":"show_profile_card","text":"Краткое обоснование выбранных параметров",
+ "model_path":"FROM_SCENE","params":{"material":"название профиля",
+ "nozzle":"значение в мм","temp_nozzle":"значение в °C","temp_bed":"значение в °C",
+ "layer_height":"значение в мм","speed":"значение в мм/с","infill":"значение в %"}}
+Используй реальные значения из инструментов. Не выдумывай недостающие значения:
+передай null. model_path = FROM_SCENE для модели в слайсере, иначе только известный
+абсолютный путь STL из запроса пользователя; экранируй обратные слеши по правилам JSON.
+JSON сам по себе НЕ изменяет настройки. Выполняй разрешённые изменения инструментами.
+Для предложения без применения карточка означает только рекомендацию, не успешную печать.
+На обычные вопросы, ошибки и необходимое уточнение отвечай обычным текстом.
+Не добавляй поле applied самостоятельно: факт применения подтверждает Python.''' 
         )}]
 
         changes = []
@@ -477,10 +538,10 @@ class AgentClient:
                             slicing, _ = self._run_slicing_and_wait(cancel, deadline, notify)
                         except Exception as slice_err:
                             slicing = {'status': 'error', 'error': str(slice_err)}
-                        return self._summary(changes, slicing) + '\n\n' + reply
+                        return self._summary(changes, slicing)
 
                     # Если это задача на подготовку/нарезку, а модель вообще не вызвала инструменты — напоминаем 1 раз:
-                    if is_full_slice_task and not changes and slicing is None and not nudged_for_action and not is_last_step:
+                    if intent in ('settings_only', 'full_slice_task') and not changes and slicing is None and not nudged_for_action and not is_last_step:
                         nudged_for_action = True
                         messages.append({'role': 'assistant', 'content': raw_content})
                         messages.append({
@@ -492,6 +553,13 @@ class AgentClient:
                     if changes or slicing or pipeline_failed:
                         reason = 'Подготовка не завершена: ' + ', '.join(sorted(pending_failures)) if pipeline_failed else None
                         return self._summary(changes, slicing, reason)
+                    # LLM may propose a profile, but cannot attest that it was applied.
+                    from .ProfileCard import parse_card
+                    card = parse_card(reply)
+                    if card is not None:
+                        card = dict(card)
+                        card['applied'] = False
+                        return json.dumps(card, ensure_ascii=False)
                     return reply
 
                 if not isinstance(calls, list) or len(calls) > 8:
@@ -504,7 +572,7 @@ class AgentClient:
                     ids.add(call['id'])
 
                 # Выполняем вызовы строго в технологическом порядке: 1) set_material -> 2) set_print_settings -> 3) start_slicing
-                priority = {'load_model': -1, 'orient_model': 1, 'set_material': 2, 'set_print_settings': 3, 'arrange_models': 4, 'validate_geometry': 5, 'start_slicing': 6}
+                priority = {'load_model': -1, 'orient_model': 1, 'set_material': 2, 'set_print_settings': 3, 'set_setting': 3, 'arrange_models': 4, 'validate_geometry': 5, 'start_slicing': 6}
                 ordered_calls = sorted(
                     calls,
                     key=lambda c: priority.get(c.get('function', {}).get('name', ''), 0)
@@ -520,8 +588,9 @@ class AgentClient:
                     self._check(cancel, deadline)
                     function = call.get('function', {})
                     name = function.get('name', '')
+                    failure_key = name
                     try:
-                        mutating = name in ('set_material', 'set_print_settings', 'start_slicing', 'load_model', 'orient_model', 'arrange_models')
+                        mutating = name in ('set_material', 'set_print_settings', 'set_setting', 'start_slicing', 'load_model', 'orient_model', 'arrange_models')
                         if mutating and (intent in ('question', 'diagnostic') or (name == 'start_slicing' and intent != 'full_slice_task')):
                             raise ValueError('Этот запрос разрешает только чтение или изменение без нарезки.')
                         if mutating and blocked_batch:
@@ -535,6 +604,8 @@ class AgentClient:
                         if not isinstance(arguments, dict):
                             raise ValueError('Аргументы инструмента должны быть JSON-объектом.')
 
+                        if name == 'set_setting':
+                            failure_key = 'set_setting:' + str(arguments.get('key', ''))
                         if name == 'set_material':
                             if not arguments.get('printer_id') and default_printer_id:
                                 arguments['printer_id'] = default_printer_id
@@ -544,6 +615,9 @@ class AgentClient:
                         if name == 'set_print_settings':
                             if 'values' not in arguments or not isinstance(arguments.get('values'), dict):
                                 raise ValueError('Передайте словарь настоящих ключей слайсера в поле "values".')
+
+                            if 'printing_mode' in arguments['values']:
+                                raise ValueError('printing_mode меняется только вручную в интерфейсе.')
 
                         fingerprint = name + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
                         if fingerprint in seen and name not in ('get_scene_models', 'analyse_orientation', 'validate_geometry'):
@@ -568,12 +642,15 @@ class AgentClient:
 
                         notify({'phase': 'start', 'name': name, 'arguments': arguments})
                         last_stage = 'Инструмент: ' + name
-                        output = self.tools.call(name, arguments, cancel_event=cancel, deadline=deadline)
+                        if name == 'set_setting':
+                            output = dispatch_setting(self.tools, arguments, cancel_event=cancel, deadline=deadline)
+                        else:
+                            output = self.tools.call(name, arguments, cancel_event=cancel, deadline=deadline)
                         seen.add(fingerprint)
 
                         if name in ('load_model','orient_model','arrange_models'):
                             changes.extend(output.get('changes', []))
-                            pending_failures.discard(name)
+                            pending_failures.discard(failure_key)
                             pipeline_failed = bool(pending_failures)
                             seen.clear()
                             has_models = True
@@ -585,20 +662,20 @@ class AgentClient:
                             if output.get('requires_user_action'):
                                 notify({'phase':'result','name':name,'output':{'ok':True,'result':output}})
                                 return self._summary(changes, slicing, '\n'.join(output.get('warnings', [])))
-                            pending_failures.discard(name)
+                            pending_failures.discard(failure_key)
                             pipeline_failed = bool(pending_failures)
                             seen = {
                                 item for item in seen
                                 if not item.startswith((
                                     'get_print_settings', 'list_print_settings',
-                                    'get_print_context', 'set_print_settings', 'start_slicing'
+                                    'get_print_context', 'set_print_settings', 'set_setting', 'start_slicing'
                                 ))
                             }
-                        elif name == 'set_print_settings':
+                        elif name in ('set_print_settings', 'set_setting'):
                             changes.extend(output.get('changes', []))
                             if output.get('skipped'):
                                 raise ValueError('Есть неприменённые настройки: ' + json.dumps(output['skipped'],ensure_ascii=False))
-                            pending_failures.discard(name)
+                            pending_failures.discard(failure_key)
                             pipeline_failed = bool(pending_failures)
                             settings_applied_in_step = True
                             seen = {
@@ -609,9 +686,9 @@ class AgentClient:
                         result = {'ok': True, 'result': output}
                     except Exception as error:
                         errors += 1
-                        if name in ('set_material', 'set_print_settings', 'start_slicing', 'load_model', 'orient_model', 'arrange_models'):
+                        if name in ('set_material', 'set_print_settings', 'set_setting', 'start_slicing', 'load_model', 'orient_model', 'arrange_models'):
                             if not blocked_batch:
-                                pending_failures.add(name)
+                                pending_failures.add(failure_key)
                             blocked_batch = True
                             pipeline_failed = True
                         result = {'ok': False, 'error': str(error).replace(config['key'], '[hidden]')}
@@ -637,6 +714,9 @@ class AgentClient:
                 if assistant_notes:
                     return self._summary(changes, slicing)
                 return self._summary(changes, slicing)
+
+            if pipeline_failed:
+                return self._summary(changes, slicing, 'Подготовка не завершена: ' + ', '.join(sorted(pending_failures)))
 
             if changes:
                 if assistant_notes:
