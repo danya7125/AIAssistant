@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>AI Assistant — STE Slicer</title>
-    <link rel="stylesheet" href="style.css?v=20261024-profile-inline">
+    <link rel="stylesheet" href="style.css?v=20261024-card-3d-2">
 </head>
 <body>
     <div class="app-shell">
@@ -26,29 +26,30 @@
             <section class="chat-panel" aria-labelledby="chat-title">
                 <div class="panel-heading">
                     <h1 id="chat-title">Чат</h1>
-                    <span class="privacy-label">Помощь по модели и настройкам печати</span>
+                    <span class="heading-actions">
+                        <span class="privacy-label">Помощь по модели и настройкам печати</span>
+                        <button id="clear-chat" class="clear-chat-button" type="button" title="Убрать переписку с экрана">Очистить чат</button>
+                    </span>
                 </div>
 
                 <div id="messages" class="messages" role="log" aria-live="polite" aria-relevant="additions">
                     <template id="profile-card-template">
                         <article class="slice-profile" aria-labelledby="profile-title">
                             <header class="profile-header">
-                                <span class="profile-eyebrow">ТЕКУЩИЙ ПРОФИЛЬ СЛАЙСЕРА</span>
+                                <span class="profile-eyebrow" data-profile-eyebrow>ТЕКУЩИЙ ПРОФИЛЬ СЛАЙСЕРА</span>
                                 <h2 id="profile-title" data-profile-title>Активные настройки</h2>
                             </header>
 
                             <div class="profile-content">
                                 <section class="profile-preview" aria-labelledby="model-title">
                                     <figure class="model-stage">
-                                        <div class="model-wheel" aria-hidden="true">
-                                            <span class="wheel-layer wheel-layer-back"></span>
-                                            <span class="wheel-layer wheel-layer-front"></span>
-                                            <span class="wheel-hub"></span>
-                                        </div>
+                                        <canvas class="model-canvas" aria-label="3D-модель, перетащите для вращения"></canvas>
+                                        <figcaption class="model-empty" data-model-empty>Нет 3D-модели</figcaption>
                                     </figure>
                                     <div class="model-description">
                                         <h3 id="model-title" data-model-name>Модель не загружена</h3>
                                         <p data-model-size>Размеры появятся после загрузки модели</p>
+                                        <p class="model-note" data-model-note hidden></p>
                                     </div>
                                     <p class="rotate-hint">
                                         <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -121,7 +122,7 @@
                             <footer class="profile-footer">
                                 <p class="profile-warning">
                                     <span class="warning-mark" aria-hidden="true">!</span>
-                                    Предварительный профиль: требует калибровки перед печатью.
+                                    <span data-profile-note>Предварительный профиль: требует калибровки перед печатью.</span>
                                 </p>
                                 <button class="apply-profile-button" type="button">Применить</button>
                             </footer>
@@ -206,7 +207,7 @@
                             <strong id="material-usage">—</strong>
                         </div>
                     </div>
-                    <button id="open-folder-btn" class="open-folder-button" type="button" style="margin-top: 14px; width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid #ccd6e4; background: #ffffff; cursor: pointer; font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+                    <button id="open-folder-btn" class="open-folder-button" type="button">
                         <span>📂</span>
                         <span>Открыть папку экспорта</span>
                     </button>
@@ -214,6 +215,6 @@
             </aside>
         </main>
     </div>
-    <script src="script.js?v=20261024-profile-inline"></script>
+    <script src="script.js?v=20261024-card-3d-2"></script>
 </body>
 </html>

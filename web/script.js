@@ -17,6 +17,8 @@ const printTime = document.getElementById('print-time');
 const materialUsage = document.getElementById('material-usage');
 const detailsToggle = document.getElementById('details-toggle');
 const workspace = document.querySelector('.workspace');
+const clearChatButton = document.getElementById('clear-chat');
+const CLEAR_MARKER_KEY = 'ai-assistant-web-cleared-tail';
 
 const REQUEST_TIMEOUT_MS = 200000;
 const MAX_ATTACHMENTS = 8;
@@ -241,27 +243,673 @@ function formatAssistantMessage(container, text) {
     closeList();
 }
 
-function shouldShowProfileCard(text, requestText, hasProfileChanges) {
-    return hasProfileChanges
-        || /(?:профил|настройк\w*\s+(?:печати|слайсера)|параметр\w*\s+(?:печати|слайсера)|контекст проекта|текущ\w*\s+(?:настройк|параметр|профил)|заполнени|скорост\w*\s+печати|температур\w*\s+(?:сопла|стола)|высот\w*\s+слоя|материал|сопло|периметр)/i.test(text)
-        || /(?:профил|настройк\w*\s+(?:печати|слайсера)|параметр\w*\s+(?:печати|слайсера)|покажи.*(?:информац|параметр|настройк|профил|значен)|выведи.*информац|файл|модель)/i.test(requestText);
+/* ============================================================
+   Карточка профиля: данные от ИИ + 3D-превью загруженной модели
+   ============================================================ */
+
+const uploadedModels = new Map();
+let lastUploadedModels = [];
+const activeViewers = [];
+const MAX_VIEWERS = 6;
+const MAX_PREVIEW_TRIANGLES = 400000;
+
+const PARAM_ALIASES = {
+    nozzle: 'machine_nozzle_size',
+    nozzle_size: 'machine_nozzle_size',
+    nozzle_temp: 'material_print_temperature',
+    nozzle_temperature: 'material_print_temperature',
+    print_temperature: 'material_print_temperature',
+    bed_temp: 'material_bed_temperature',
+    bed_temperature: 'material_bed_temperature',
+    speed: 'speed_print',
+    print_speed: 'speed_print',
+    wall_speed: 'speed_wall',
+    outer_wall_speed: 'speed_wall',
+    first_layer_speed: 'speed_layer_0',
+    infill: 'infill_sparse_density',
+    infill_density: 'infill_sparse_density',
+    walls: 'wall_line_count',
+    perimeters: 'wall_line_count'
+};
+
+const PARAM_META = {
+    material: { label: 'Материал', group: 'Материал' },
+    machine_nozzle_size: { label: 'Сопло', unit: ' мм', group: 'Печать' },
+    material_print_temperature: { label: 'Температура сопла', unit: '°C', group: 'Печать' },
+    material_bed_temperature: { label: 'Температура стола', unit: '°C', group: 'Печать' },
+    layer_height: { label: 'Высота слоя', unit: ' мм', group: 'Печать' },
+    line_width: { label: 'Ширина линии', unit: ' мм', group: 'Печать' },
+    wall_line_count: { label: 'Периметры', group: 'Печать' },
+    top_layers: { label: 'Верхние слои', group: 'Печать' },
+    bottom_layers: { label: 'Нижние слои', group: 'Печать' },
+    printing_mode: { label: 'Режим печати', group: 'Печать' },
+    speed_print: { label: 'Печать', unit: ' мм/с', group: 'Скорости' },
+    speed_wall: { label: 'Внешняя стенка', unit: ' мм/с', group: 'Скорости' },
+    speed_layer_0: { label: 'Первый слой', unit: ' мм/с', group: 'Скорости' },
+    infill_sparse_density: { label: 'Заполнение', unit: '%', group: 'Заполнение' },
+    infill_pattern: { label: 'Шаблон заполнения', group: 'Заполнение' },
+    cool_fan_speed: { label: 'Обдув', unit: '%', group: 'Прочее' },
+    retraction_amount: { label: 'Откат', unit: ' мм', group: 'Прочее' },
+    adhesion_type: { label: 'Адгезия', group: 'Прочее' },
+    brim_width: { label: 'Кайма', unit: ' мм', group: 'Прочее' },
+    support_enable: { label: 'Поддержки', group: 'Прочее' }
+};
+
+const GROUP_ORDER = ['Материал', 'Печать', 'Скорости', 'Заполнение', 'Прочее'];
+
+function tryParseJson(source) {
+    try {
+        const value = JSON.parse(String(source).trim());
+        return value && typeof value === 'object' ? value : null;
+    } catch (error) {
+        return null;
+    }
 }
 
-function appendProfileCard(messageElement) {
-    if (!profileCardTemplate || !profileCardTemplate.content.firstElementChild) {
+function normalizeCardObject(value) {
+    if (!value || typeof value !== 'object') {
+        return null;
+    }
+    const card = value.card && typeof value.card === 'object' ? value.card : value;
+    const looksLikeCard = card.action === 'show_profile_card' || value.action === 'show_profile_card' ||
+        (card.params && typeof card.params === 'object') || Array.isArray(card.rows);
+    return looksLikeCard ? card : null;
+}
+
+/* Ищет в ответе ИИ команду карточки: [CARD]{...}[/CARD], блок ```json или чистый JSON. */
+function extractCard(text) {
+    const result = { card: null, rest: text };
+
+    const tagged = /\[CARD\]([\s\S]*?)\[\/CARD\]/i.exec(text);
+    if (tagged) {
+        const card = normalizeCardObject(tryParseJson(tagged[1]));
+        if (card) {
+            result.card = card;
+            result.rest = text.replace(tagged[0], '').trim();
+            return result;
+        }
+    }
+
+    const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
+    let match;
+    while ((match = fence.exec(text)) !== null) {
+        const card = normalizeCardObject(tryParseJson(match[1]));
+        if (card) {
+            result.card = card;
+            result.rest = text.replace(match[0], '').trim();
+            return result;
+        }
+    }
+
+    const trimmed = text.trim();
+    if (trimmed.charAt(0) === '{' && trimmed.charAt(trimmed.length - 1) === '}') {
+        const card = normalizeCardObject(tryParseJson(trimmed));
+        if (card) {
+            result.card = card;
+            result.rest = '';
+        }
+    }
+    return result;
+}
+
+function shouldShowProfileCard(text, requestText, hasProfileChanges) {
+    return Boolean(hasProfileChanges) ||
+        /(?:профил|настройк\w*\s+(?:печати|слайсера)|параметр\w*\s+(?:печати|слайсера)|покажи.*(?:параметр|настройк|профил)|прикреплённ|прикреплены|\.stl)/i
+            .test(requestText || '');
+}
+
+function formatCardValue(value, unit) {
+    if (typeof value === 'boolean') {
+        return value ? 'Да' : 'Нет';
+    }
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!trimmed) {
+            return '—';
+        }
+        return /^-?\d+(?:[.,]\d+)?$/.test(trimmed) ? trimmed + unit : trimmed;
+    }
+    return formatProfileValue(value, unit);
+}
+
+function collectCardRows(data) {
+    const rows = [];
+    const params = data.params && typeof data.params === 'object' && !Array.isArray(data.params)
+        ? data.params : {};
+    Object.keys(params).forEach(function (name) {
+        const raw = params[name];
+        if (raw === null || raw === undefined || typeof raw === 'object') {
+            return;
+        }
+        const key = PARAM_ALIASES[name] || name;
+        const meta = PARAM_META[key] || {};
+        rows.push({
+            key: key,
+            raw: raw,
+            label: meta.label || name.replace(/_/g, ' '),
+            group: meta.group || 'Прочее',
+            value: formatCardValue(raw, meta.unit || '')
+        });
+    });
+    if (Array.isArray(data.rows)) {
+        data.rows.forEach(function (row) {
+            if (row && row.label !== undefined && row.label !== null) {
+                rows.push({
+                    key: null,
+                    raw: row.value,
+                    label: String(row.label),
+                    group: String(row.group || 'Прочее'),
+                    value: formatCardValue(row.value, row.unit || '')
+                });
+            }
+        });
+    }
+    return rows;
+}
+
+function buildCardSettings(card, rows) {
+    const container = card.querySelector('.profile-settings');
+    if (!container) {
         return;
+    }
+    while (container.firstChild) {
+        container.removeChild(container.firstChild);
+    }
+    if (!rows.length) {
+        const empty = document.createElement('p');
+        empty.className = 'empty-state';
+        empty.textContent = 'Параметры не переданы.';
+        container.appendChild(empty);
+        return;
+    }
+    const groups = new Map();
+    rows.forEach(function (row) {
+        if (!groups.has(row.group)) {
+            groups.set(row.group, []);
+        }
+        groups.get(row.group).push(row);
+    });
+    const names = Array.from(groups.keys()).sort(function (a, b) {
+        const ia = GROUP_ORDER.indexOf(a);
+        const ib = GROUP_ORDER.indexOf(b);
+        return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    });
+    names.forEach(function (name) {
+        const section = document.createElement('section');
+        section.className = 'parameter-group';
+        const heading = document.createElement('h3');
+        heading.textContent = name;
+        const list = document.createElement('dl');
+        list.className = 'parameter-list';
+        groups.get(name).forEach(function (row) {
+            const line = document.createElement('div');
+            line.className = 'parameter-row';
+            const term = document.createElement('dt');
+            term.textContent = row.label;
+            const value = document.createElement('dd');
+            value.textContent = row.value;
+            line.appendChild(term);
+            line.appendChild(value);
+            list.appendChild(line);
+        });
+        section.appendChild(heading);
+        section.appendChild(list);
+        container.appendChild(section);
+    });
+}
+
+function baseName(name) {
+    return String(name || '').split(/[\\/]/).pop();
+}
+
+function pickModelFile(name, files) {
+    if (name) {
+        const found = uploadedModels.get(baseName(name).toLowerCase());
+        if (found) {
+            return found;
+        }
+    }
+    const list = files && files.length ? files : lastUploadedModels;
+    return list.length ? list[0] : null;
+}
+
+/* ---------- STL: разбор и подготовка сетки ---------- */
+
+function parseSTL(buffer) {
+    const size = buffer.byteLength;
+    let positions = null;
+    if (size >= 84) {
+        const view = new DataView(buffer);
+        const count = view.getUint32(80, true);
+        if (count > 0 && 84 + count * 50 === size) {
+            positions = new Float32Array(count * 9);
+            let offset = 84;
+            for (let i = 0; i < count; i += 1) {
+                offset += 12;
+                for (let k = 0; k < 9; k += 1) {
+                    positions[i * 9 + k] = view.getFloat32(offset, true);
+                    offset += 4;
+                }
+                offset += 2;
+            }
+        }
+    }
+    if (!positions) {
+        const text = new TextDecoder('utf-8').decode(buffer);
+        const pattern = /vertex\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)/g;
+        const values = [];
+        let match;
+        while ((match = pattern.exec(text)) !== null) {
+            values.push(parseFloat(match[1]), parseFloat(match[2]), parseFloat(match[3]));
+        }
+        if (values.length < 9 || values.length % 9) {
+            throw new Error('файл не похож на STL');
+        }
+        positions = Float32Array.from(values);
+    }
+    return positions;
+}
+
+function prepareMesh(source) {
+    let triangles = source.length / 9;
+    const stride = triangles > MAX_PREVIEW_TRIANGLES ? Math.ceil(triangles / MAX_PREVIEW_TRIANGLES) : 1;
+    const kept = Math.ceil(triangles / stride);
+    const positions = new Float32Array(kept * 9);
+    let n = 0;
+    for (let i = 0; i < triangles; i += stride) {
+        for (let k = 0; k < 9; k += 1) {
+            positions[n * 9 + k] = source[i * 9 + k];
+        }
+        n += 1;
+    }
+    triangles = n;
+
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < triangles * 3; i += 1) {
+        for (let a = 0; a < 3; a += 1) {
+            const v = positions[i * 3 + a];
+            if (!Number.isFinite(v)) {
+                throw new Error('в модели есть нечисловые координаты');
+            }
+            if (v < min[a]) { min[a] = v; }
+            if (v > max[a]) { max[a] = v; }
+        }
+    }
+    const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+    let radius = 0;
+    for (let i = 0; i < triangles * 3; i += 1) {
+        const dx = positions[i * 3] - center[0];
+        const dy = positions[i * 3 + 1] - center[1];
+        const dz = positions[i * 3 + 2] - center[2];
+        radius = Math.max(radius, Math.sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    radius = radius || 1;
+
+    const normals = new Float32Array(triangles * 9);
+    for (let i = 0; i < triangles; i += 1) {
+        const o = i * 9;
+        for (let k = 0; k < 9; k += 3) {
+            positions[o + k] = (positions[o + k] - center[0]) / radius;
+            positions[o + k + 1] = (positions[o + k + 1] - center[1]) / radius;
+            positions[o + k + 2] = (positions[o + k + 2] - center[2]) / radius;
+        }
+        const ux = positions[o + 3] - positions[o];
+        const uy = positions[o + 4] - positions[o + 1];
+        const uz = positions[o + 5] - positions[o + 2];
+        const vx = positions[o + 6] - positions[o];
+        const vy = positions[o + 7] - positions[o + 1];
+        const vz = positions[o + 8] - positions[o + 2];
+        let nx = uy * vz - uz * vy;
+        let ny = uz * vx - ux * vz;
+        let nz = ux * vy - uy * vx;
+        const length = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        nx /= length; ny /= length; nz /= length;
+        for (let k = 0; k < 9; k += 3) {
+            normals[o + k] = nx;
+            normals[o + k + 1] = ny;
+            normals[o + k + 2] = nz;
+        }
+    }
+    return {
+        positions: positions,
+        normals: normals,
+        vertexCount: triangles * 3,
+        size: { x: max[0] - min[0], y: max[1] - min[1], z: max[2] - min[2] }
+    };
+}
+
+/* ---------- Минимальный WebGL-просмотрщик без внешних библиотек ---------- */
+
+function mat4Multiply(a, b) {
+    const out = new Float32Array(16);
+    for (let c = 0; c < 4; c += 1) {
+        for (let r = 0; r < 4; r += 1) {
+            let sum = 0;
+            for (let k = 0; k < 4; k += 1) {
+                sum += a[k * 4 + r] * b[c * 4 + k];
+            }
+            out[c * 4 + r] = sum;
+        }
+    }
+    return out;
+}
+
+function mat4RotateX(angle) {
+    const c = Math.cos(angle);
+    const s = Math.sin(angle);
+    return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
+}
+
+function mat4RotateY(angle) {
+    const c = Math.cos(angle);
+    const s = Math.sin(angle);
+    return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
+}
+
+function mat4Perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2);
+    return new Float32Array([
+        f / aspect, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (far + near) / (near - far), -1,
+        0, 0, 2 * far * near / (near - far), 0
+    ]);
+}
+
+function createModelViewer(canvas, mesh) {
+    const options = { antialias: true, alpha: true };
+    const gl = canvas.getContext('webgl', options) || canvas.getContext('experimental-webgl', options);
+    if (!gl) {
+        return null;
+    }
+
+    function compile(type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            throw new Error(gl.getShaderInfoLog(shader) || 'ошибка шейдера');
+        }
+        return shader;
+    }
+
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER,
+        'attribute vec3 aPos;attribute vec3 aNorm;uniform mat4 uMVP;uniform mat4 uRot;varying vec3 vN;' +
+        'void main(){vN=(uRot*vec4(aNorm,0.0)).xyz;gl_Position=uMVP*vec4(aPos,1.0);}'));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER,
+        'precision mediump float;varying vec3 vN;' +
+        'void main(){vec3 n=normalize(vN);' +
+        'float key=dot(n,normalize(vec3(-0.45,0.75,0.6)))*0.5+0.5;' +
+        'float fill=dot(n,normalize(vec3(0.7,-0.3,0.4)))*0.5+0.5;' +
+        'vec3 base=vec3(0.50,0.72,0.80);' +
+        'vec3 color=base*(0.32+0.62*key*key+0.18*fill);' +
+        'gl_FragColor=vec4(color,1.0);}'));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error('не удалось собрать шейдеры');
+    }
+    gl.useProgram(program);
+
+    function bindBuffer(data, name) {
+        const buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+        const location = gl.getAttribLocation(program, name);
+        gl.enableVertexAttribArray(location);
+        gl.vertexAttribPointer(location, 3, gl.FLOAT, false, 0, 0);
+        return buffer;
+    }
+    const positionBuffer = bindBuffer(mesh.positions, 'aPos');
+    const normalBuffer = bindBuffer(mesh.normals, 'aNorm');
+    const mvpLocation = gl.getUniformLocation(program, 'uMVP');
+    const rotLocation = gl.getUniformLocation(program, 'uRot');
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(0, 0, 0, 0);
+
+    const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const zUp = mat4RotateX(-Math.PI / 2);
+    let yaw = -0.6;
+    let pitch = 0.5;
+    let hovering = false;
+    let dragging = false;
+    let frame = 0;
+    let lastTime = 0;
+    let lastX = 0;
+    let lastY = 0;
+    let disposed = false;
+
+    function resize() {
+        const ratio = Math.min(window.devicePixelRatio || 1, 2);
+        const width = Math.round(canvas.clientWidth * ratio);
+        const height = Math.round(canvas.clientHeight * ratio);
+        if (width > 0 && height > 0 && (canvas.width !== width || canvas.height !== height)) {
+            canvas.width = width;
+            canvas.height = height;
+        }
+    }
+
+    function draw() {
+        if (disposed) {
+            return;
+        }
+        resize();
+        if (!canvas.width || !canvas.height) {
+            return;
+        }
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        const aspect = canvas.width / canvas.height;
+        const distance = 3.9 / Math.min(1, aspect);
+        const rotation = mat4Multiply(mat4RotateX(pitch), mat4Multiply(mat4RotateY(yaw), zUp));
+        const move = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -distance, 1]);
+        const mvp = mat4Multiply(mat4Perspective(0.56, aspect, 0.1, 50),
+            mat4Multiply(move, rotation));
+        gl.uniformMatrix4fv(mvpLocation, false, mvp);
+        gl.uniformMatrix4fv(rotLocation, false, rotation);
+        gl.drawArrays(gl.TRIANGLES, 0, mesh.vertexCount);
+    }
+
+    function tick(time) {
+        frame = 0;
+        if (disposed) {
+            return;
+        }
+        const delta = lastTime ? Math.min(0.05, (time - lastTime) / 1000) : 0;
+        lastTime = time;
+        if (hovering && !dragging && !reduceMotion) {
+            yaw += delta * 0.9;
+        }
+        draw();
+        if (hovering || dragging) {
+            frame = requestAnimationFrame(tick);
+        } else {
+            lastTime = 0;
+        }
+    }
+
+    function start() {
+        if (!frame && !disposed) {
+            frame = requestAnimationFrame(tick);
+        }
+    }
+
+    function stopDrag() {
+        dragging = false;
+        canvas.classList.remove('is-grabbing');
+    }
+
+    canvas.addEventListener('pointerenter', function () { hovering = true; start(); });
+    canvas.addEventListener('pointerleave', function () { hovering = false; });
+    canvas.addEventListener('pointerdown', function (event) {
+        dragging = true;
+        lastX = event.clientX;
+        lastY = event.clientY;
+        canvas.classList.add('is-grabbing');
+        if (canvas.setPointerCapture) {
+            canvas.setPointerCapture(event.pointerId);
+        }
+        start();
+    });
+    canvas.addEventListener('pointermove', function (event) {
+        if (!dragging) {
+            return;
+        }
+        yaw += (event.clientX - lastX) * 0.01;
+        pitch = Math.max(-1.5, Math.min(1.5, pitch + (event.clientY - lastY) * 0.01));
+        lastX = event.clientX;
+        lastY = event.clientY;
+    });
+    canvas.addEventListener('pointerup', stopDrag);
+    canvas.addEventListener('pointercancel', stopDrag);
+    canvas.addEventListener('dblclick', function () {
+        yaw = -0.6;
+        pitch = 0.5;
+        draw();
+    });
+
+    let observer = null;
+    if (window.ResizeObserver) {
+        observer = new ResizeObserver(draw);
+        observer.observe(canvas);
+    }
+    draw();
+
+    return {
+        dispose: function () {
+            disposed = true;
+            if (frame) {
+                cancelAnimationFrame(frame);
+            }
+            if (observer) {
+                observer.disconnect();
+            }
+            gl.deleteBuffer(positionBuffer);
+            gl.deleteBuffer(normalBuffer);
+            const lose = gl.getExtension('WEBGL_lose_context');
+            if (lose) {
+                lose.loseContext();
+            }
+        }
+    };
+}
+
+async function loadModelIntoCard(card, source) {
+    const stage = card.querySelector('.model-stage');
+    const canvas = card.querySelector('.model-canvas');
+    const empty = card.querySelector('[data-model-empty]');
+    const sizeElement = card.querySelector('[data-model-size]');
+    if (!stage || !canvas || !empty) {
+        return;
+    }
+    empty.hidden = false;
+    empty.textContent = 'Загрузка модели…';
+    try {
+        let buffer;
+        if (typeof source === 'string') {
+            if (source.charAt(0) !== '/') {
+                throw new Error('разрешены только пути на этом сервере');
+            }
+            const response = await fetch(source);
+            if (!response.ok) {
+                throw new Error('HTTP ' + response.status);
+            }
+            buffer = await response.arrayBuffer();
+        } else {
+            buffer = await source.arrayBuffer();
+        }
+        const mesh = prepareMesh(parseSTL(buffer));
+        if (!card.isConnected) {
+            return;
+        }
+        const viewer = createModelViewer(canvas, mesh);
+        if (!viewer) {
+            empty.textContent = 'WebGL недоступен: 3D-превью не показано.';
+            return;
+        }
+        activeViewers.push(viewer);
+        while (activeViewers.length > MAX_VIEWERS) {
+            activeViewers.shift().dispose();
+        }
+        stage.classList.add('has-model');
+        empty.hidden = true;
+        if (sizeElement) {
+            sizeElement.textContent = 'Размеры: ' + [mesh.size.x, mesh.size.y, mesh.size.z]
+                .map(function (v) { return formatProfileValue(v, ''); }).join(' × ') + ' мм';
+        }
+    } catch (error) {
+        empty.hidden = false;
+        empty.textContent = 'Не удалось показать модель: ' + error.message;
+    }
+}
+
+/* ---------- Сборка карточки ---------- */
+
+function fillProposalCard(card, data, rows) {
+    const eyebrow = card.querySelector('[data-profile-eyebrow]');
+    if (eyebrow) {
+        eyebrow.textContent = String(data.eyebrow || 'Рекомендованный профиль').toUpperCase();
+    }
+    const title = card.querySelector('[data-profile-title]');
+    if (title) {
+        title.textContent = data.title || 'Стартовый профиль';
+    }
+    const modelName = card.querySelector('[data-model-name]');
+    const rawName = data.model_name || data.model || data.name || '';
+    if (modelName) {
+        modelName.textContent = rawName ? baseName(rawName).replace(/\.stl$/i, '') : 'Модель';
+    }
+    const note = card.querySelector('[data-model-note]');
+    if (note && data.conditions) {
+        note.textContent = String(data.conditions);
+        note.hidden = false;
+    }
+    const warning = card.querySelector('[data-profile-note]');
+    if (warning) {
+        warning.textContent = data.warning || 'Предварительный профиль: требует калибровки перед печатью.';
+    }
+    buildCardSettings(card, rows);
+}
+
+function setupApplyButton(card, data, rows) {
+    const button = card.querySelector('.apply-profile-button');
+    if (!button) {
+        return;
+    }
+    const lines = rows.filter(function (row) { return row.key; })
+        .map(function (row) { return row.key + ' = ' + row.raw; });
+    if (!lines.length) {
+        button.hidden = true;
+        return;
+    }
+    button.addEventListener('click', function () {
+        if (isSending) {
+            statusText.textContent = 'Дождитесь завершения текущего запроса.';
+            return;
+        }
+        submitMessage(
+            'Применить профиль «' + (data.title || 'стартовый профиль') + '» в слайсере:\n' +
+            lines.join('\n') + '\nПрименяй материал и параметры печати как указано.',
+            []
+        );
+    });
+}
+
+function appendProfileCard(messageElement, cardData, modelFile) {
+    if (!profileCardTemplate || !profileCardTemplate.content.firstElementChild) {
+        return null;
     }
     const card = profileCardTemplate.content.firstElementChild.cloneNode(true);
     profileCardSequence += 1;
     const ids = new Map();
     card.querySelectorAll('[id]').forEach(function (element) {
-        const originalId = element.id;
-        const uniqueId = originalId + '-' + profileCardSequence;
-        ids.set(originalId, uniqueId);
+        const uniqueId = element.id + '-' + profileCardSequence;
+        ids.set(element.id, uniqueId);
         element.id = uniqueId;
     });
-    card.querySelectorAll('[aria-labelledby], [aria-describedby], [aria-controls]').forEach(function (element) {
-        ['aria-labelledby', 'aria-describedby', 'aria-controls'].forEach(function (attribute) {
+    ['aria-labelledby', 'aria-describedby', 'aria-controls'].forEach(function (attribute) {
+        [card].concat(Array.from(card.querySelectorAll('[' + attribute + ']'))).forEach(function (element) {
             const value = element.getAttribute(attribute);
             if (value) {
                 element.setAttribute(attribute, value.split(/\s+/).map(function (id) {
@@ -270,20 +918,59 @@ function appendProfileCard(messageElement) {
             }
         });
     });
-    const labelledBy = card.getAttribute('aria-labelledby');
-    if (labelledBy) {
-        card.setAttribute('aria-labelledby', labelledBy.split(/\s+/).map(function (id) {
-            return ids.get(id) || id;
-        }).join(' '));
+
+    const file = modelFile === undefined ? pickModelFile(null, null) : modelFile;
+    let source = file || null;
+
+    if (cardData) {
+        const rows = collectCardRows(cardData);
+        card.dataset.live = 'false';
+        fillProposalCard(card, cardData, rows);
+        setupApplyButton(card, cardData, rows);
+        if (!source && typeof cardData.model_url === 'string') {
+            source = cardData.model_url;
+        }
+    } else {
+        card.dataset.live = 'true';
+        const applyButton = card.querySelector('.apply-profile-button');
+        if (applyButton) {
+            applyButton.hidden = true;
+        }
+        const warning = card.querySelector('[data-profile-note]');
+        if (warning) {
+            warning.textContent = 'Текущие значения из слайсера.';
+        }
     }
 
-    const profileContainer = document.createElement('div');
-    profileContainer.className = 'message-profile';
-    profileContainer.appendChild(card);
-    messageElement.appendChild(profileContainer);
+    if (file) {
+        card.dataset.localModel = 'true';
+        const name = card.querySelector('[data-model-name]');
+        if (name && (!cardData || !name.textContent || name.textContent === 'Модель')) {
+            name.textContent = file.name.replace(/\.stl$/i, '');
+        }
+    }
+
+    const container = document.createElement('div');
+    container.className = 'message-profile';
+    container.appendChild(card);
+    const body = messageElement.querySelector('.message-body');
+    if (body) {
+        body.after(container);
+    } else {
+        messageElement.appendChild(container);
+    }
+    if (!cardData) {
+        // «Живая» карточка появится, только когда слайсер вернёт данные.
+        container.hidden = true;
+    }
+
+    if (source) {
+        loadModelIntoCard(card, source);
+    }
+    return card;
 }
 
-function addMessage(author, text, type, attachments, requestText, hasProfileChanges) {
+function addMessage(author, text, type, attachments, requestText, hasProfileChanges, modelFiles) {
     const messageElement = document.createElement('article');
     messageElement.className = 'message ' + type;
 
@@ -293,8 +980,20 @@ function addMessage(author, text, type, attachments, requestText, hasProfileChan
 
     const bodyElement = document.createElement('div');
     bodyElement.className = 'message-body';
+
+    let cardData = null;
+    let wantsLiveCard = false;
     if (type === 'assistant') {
-        formatAssistantMessage(bodyElement, text);
+        const parsed = extractCard(text);
+        cardData = parsed.card;
+        const bodyText = parsed.rest;
+        wantsLiveCard = !cardData && shouldShowProfileCard(text, requestText || '', hasProfileChanges);
+
+        if (!bodyText.trim()) {
+            bodyElement.hidden = true;
+        } else {
+            formatAssistantMessage(bodyElement, bodyText);
+        }
     } else {
         bodyElement.textContent = text;
     }
@@ -341,16 +1040,56 @@ function addMessage(author, text, type, attachments, requestText, hasProfileChan
         messageElement.appendChild(disclaimer);
     }
 
-    if (type === 'assistant' && shouldShowProfileCard(text, requestText || '', hasProfileChanges)) {
-        appendProfileCard(messageElement);
+    messageList.appendChild(messageElement);
+
+    if (cardData) {
+        const nameHint = cardData.model_name || cardData.model || cardData.name;
+        appendProfileCard(messageElement, cardData, pickModelFile(nameHint, modelFiles));
+    } else if (wantsLiveCard) {
+        appendProfileCard(messageElement, null, pickModelFile(null, modelFiles));
     }
 
-    messageList.appendChild(messageElement);
     if (type === 'assistant') {
         lastAssistantMessageElement = messageElement;
     }
-    messageList.scrollTop = messageList.scrollHeight;
+    if (type === 'assistant' && (cardData || wantsLiveCard)) {
+        // Ответ высокий: показываем его с начала, а не с конца.
+        messageList.scrollTop = Math.max(0, messageElement.offsetTop - messageList.offsetTop - 12);
+    } else {
+        messageList.scrollTop = messageList.scrollHeight;
+    }
     return messageElement;
+}
+
+function finalizeLiveCard(card) {
+    const container = card.closest('.message-profile');
+    let visibleRows = 0;
+    card.querySelectorAll('.parameter-row').forEach(function (row) {
+        const value = row.querySelector('dd');
+        const empty = !value || value.textContent.trim() === '—';
+        row.hidden = empty;
+        if (!empty) {
+            visibleRows += 1;
+        }
+    });
+    card.querySelectorAll('.parameter-group').forEach(function (group) {
+        group.hidden = !group.querySelector('.parameter-row:not([hidden])');
+    });
+    let note = card.querySelector('.profile-empty');
+    if (!note) {
+        note = document.createElement('p');
+        note.className = 'empty-state profile-empty';
+        note.textContent = 'Параметры слайсера пока недоступны.';
+        const settings = card.querySelector('.profile-settings');
+        if (settings) {
+            settings.appendChild(note);
+        }
+    }
+    note.hidden = visibleRows > 0;
+    const hasModel = card.dataset.localModel === 'true';
+    if (container) {
+        container.hidden = !(visibleRows > 0 || hasModel);
+    }
 }
 
 function addActivity(eventData) {
@@ -463,7 +1202,7 @@ function refreshProfile(changedKeys) {
             const mode = settings.printing_mode === 'classic' ? 'FDM' : settings.printing_mode;
             const model = context.models && context.models.length ? context.models[0] : null;
 
-            document.querySelectorAll('.slice-profile').forEach(function (profileCard) {
+            document.querySelectorAll('.slice-profile[data-live="true"]').forEach(function (profileCard) {
                 const title = profileCard.querySelector('[data-profile-title]');
                 if (title) {
                     title.textContent = (mode ? mode + ' · ' : '') +
@@ -485,10 +1224,11 @@ function refreshProfile(changedKeys) {
 
                 const modelName = profileCard.querySelector('[data-model-name]');
                 const modelSize = profileCard.querySelector('[data-model-size]');
-                if (modelName) {
+                const localModel = profileCard.dataset.localModel === 'true';
+                if (modelName && !localModel) {
                     modelName.textContent = model ? model.name : 'Модель не загружена';
                 }
-                if (modelSize) {
+                if (modelSize && !localModel) {
                     const size = model && model.size_mm;
                     modelSize.textContent = size
                         ? 'Размеры: ' + ['x', 'y', 'z'].map(function (axis) {
@@ -497,6 +1237,10 @@ function refreshProfile(changedKeys) {
                         : 'Размеры появятся после загрузки модели';
                 }
 
+                const materialCell = profileCard.querySelector('[data-profile-material]');
+                if (materialCell && materialCell.textContent.trim() === '') {
+                    materialCell.textContent = '—';
+                }
                 profileCard.querySelectorAll('[data-setting]').forEach(function (element) {
                     const key = element.getAttribute('data-setting');
                     if (Object.prototype.hasOwnProperty.call(settings, key)) {
@@ -516,10 +1260,12 @@ function refreshProfile(changedKeys) {
                         }, 1800);
                     }
                 });
+                finalizeLiveCard(profileCard);
             });
         })
         .catch(function (error) {
-            statusText.textContent = 'Не удалось обновить профиль слайсера: ' + error.message;
+            document.querySelectorAll('.slice-profile[data-live="true"]').forEach(finalizeLiveCard);
+            statusText.textContent = 'Профиль слайсера недоступен (' + error.message + '). Карточки с данными ИИ работают без него.';
         });
 }
 
@@ -649,6 +1395,68 @@ async function pollAgentEvents() {
     }
 }
 
+function readClearMarker() {
+    try {
+        return localStorage.getItem(CLEAR_MARKER_KEY);
+    } catch (error) {
+        return null;
+    }
+}
+
+function writeClearMarker(value) {
+    try {
+        if (value === null) {
+            localStorage.removeItem(CLEAR_MARKER_KEY);
+        } else {
+            localStorage.setItem(CLEAR_MARKER_KEY, value);
+        }
+    } catch (error) {
+        /* без localStorage чат просто покажет историю заново */
+    }
+}
+
+async function clearChat() {
+    if (isSending) {
+        statusText.textContent = 'Дождитесь ответа, затем очистите чат.';
+        return;
+    }
+    try {
+        const response = await fetch('/api/history');
+        if (response.ok) {
+            const data = await response.json();
+            const list = Array.isArray(data.messages) ? data.messages : [];
+            writeClearMarker(list.length ? JSON.stringify({
+                role: list[list.length - 1].role,
+                content: list[list.length - 1].content,
+                count: list.length
+            }) : null);
+        }
+    } catch (error) {
+        /* сервер недоступен: очищаем только экран */
+    }
+    activeViewers.splice(0).forEach(function (viewer) { viewer.dispose(); });
+    uploadedModels.clear();
+    lastUploadedModels = [];
+    lastAssistantMessageElement = null;
+    Array.prototype.slice.call(messageList.children).forEach(function (child) {
+        if (child !== profileCardTemplate) {
+            messageList.removeChild(child);
+        }
+    });
+    while (activityList.firstChild) {
+        activityList.removeChild(activityList.firstChild);
+    }
+    activityEmpty.hidden = false;
+    selectedFiles = [];
+    renderAttachments();
+    statusText.textContent = 'Чат очищен.';
+    messageInput.focus();
+}
+
+if (clearChatButton) {
+    clearChatButton.addEventListener('click', clearChat);
+}
+
 async function loadConversation() {
     try {
         const response = await fetch('/api/history');
@@ -657,8 +1465,22 @@ async function loadConversation() {
         }
         const data = await response.json();
         if (Array.isArray(data.messages)) {
+            let visibleMessages = data.messages;
+            const markerText = readClearMarker();
+            if (markerText) {
+                const marker = tryParseJson(markerText);
+                if (marker) {
+                    for (let i = data.messages.length - 1; i >= 0; i -= 1) {
+                        const item = data.messages[i];
+                        if (item && item.role === marker.role && item.content === marker.content) {
+                            visibleMessages = data.messages.slice(i + 1);
+                            break;
+                        }
+                    }
+                }
+            }
             let lastUserText = '';
-            data.messages.forEach(function (message) {
+            visibleMessages.forEach(function (message) {
                 if (!message || typeof message.content !== 'string') {
                     return;
                 }
@@ -694,19 +1516,18 @@ async function loadConversation() {
     setInterval(pollAgentEvents, 500);
 }
 
-async function sendMessage(event) {
-    event.preventDefault();
-
-    const typedText = messageInput.value.trim();
-    if ((!typedText && !selectedFiles.length) || isSending) {
+async function submitMessage(messageText, messageAttachments) {
+    if (isSending) {
         return;
     }
+    messageAttachments = messageAttachments || [];
+    messageAttachments.forEach(function (file) {
+        uploadedModels.set(baseName(file.name).toLowerCase(), file);
+    });
+    if (messageAttachments.length) {
+        lastUploadedModels = messageAttachments.slice();
+    }
 
-    const messageAttachments = selectedFiles.slice();
-    const messageText = typedText || 'Прикреплённые файлы: ' +
-        messageAttachments.map(function (file) {
-            return file.name;
-        }).join(', ');
     isSending = true;
     pendingProfileChanges = false;
     lastAssistantMessageElement = null;
@@ -752,7 +1573,8 @@ async function sendMessage(event) {
             'assistant',
             null,
             messageText,
-            pendingProfileChanges || messageAttachments.length > 0
+            pendingProfileChanges || messageAttachments.length > 0,
+            messageAttachments
         );
         const attachmentDisclaimer = userMessage.querySelector('.attachment-disclaimer');
         if (attachmentDisclaimer) {
@@ -780,6 +1602,21 @@ async function sendMessage(event) {
         sendButton.disabled = false;
         messageInput.focus();
     }
+}
+
+function sendMessage(event) {
+    event.preventDefault();
+
+    const typedText = messageInput.value.trim();
+    if ((!typedText && !selectedFiles.length) || isSending) {
+        return;
+    }
+    const messageAttachments = selectedFiles.slice();
+    const messageText = typedText || 'Прикреплённые файлы: ' +
+        messageAttachments.map(function (file) {
+            return file.name;
+        }).join(', ');
+    return submitMessage(messageText, messageAttachments);
 }
 
 attachmentInput.addEventListener('change', function () {
