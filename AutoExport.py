@@ -72,33 +72,28 @@ def auto_export_project_and_gcode():
     # 1. Export G-Code
     gcode_path = os.path.join(target_dir, "{0}.gcode".format(model_name))
     try:
-        gcode_writer = app.getMeshFileHandler().getWriter("GCodeWriter")
-        if gcode_writer is not None:
-            with open(gcode_path, "wt", encoding="utf-8") as stream:
-                success = gcode_writer.write(stream, [root], MeshWriter.OutputMode.TextMode)
-                if success is not False:
-                    saved_files.append(gcode_path)
-                else:
-                    errors.append("GCodeWriter вернул False при экспорте.")
-        else:
-            with open(gcode_path, "wt", encoding="utf-8") as stream:
-                for line in gcode_dict[plate]:
-                    stream.write(line)
-            saved_files.append(gcode_path)
+        with open(gcode_path, "wt", encoding="utf-8") as stream:
+            gcode_data = gcode_dict[plate]
+            if isinstance(gcode_data, str):
+                stream.write(gcode_data)
+            else:
+                for chunk in gcode_data:
+                    stream.write(chunk)
+        saved_files.append(gcode_path)
     except Exception as e:
         errors.append("Ошибка сохранения G-Code: " + str(e))
         
     # 2. Export 3MF Workspace
     threemf_path = os.path.join(target_dir, "{0}.3mf".format(model_name))
     try:
-        workspace_writer = app.getWorkspaceFileHandler().getWriter("3MFWriter")
+        workspace_writer = app.getWorkspaceFileHandler().getWriter("3MFWorkspaceWriter")
         if workspace_writer is not None:
             with open(threemf_path, "wb") as stream:
                 success = workspace_writer.write(stream, [root], WorkspaceWriter.OutputMode.BinaryMode)
                 if success is not False:
                     saved_files.append(threemf_path)
                 else:
-                    errors.append("3MFWriter вернул False.")
+                    errors.append("3MFWorkspaceWriter вернул False.")
         else:
             mesh_3mf_writer = app.getMeshFileHandler().getWriter("3MFWriter")
             if mesh_3mf_writer is not None:
