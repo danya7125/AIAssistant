@@ -1,4 +1,4 @@
-import copy
+﻿import copy
 import http.client
 import ast
 import json
@@ -258,23 +258,42 @@ class AgentClient:
     @staticmethod
     def _classify_intent(text, task_text=None, has_models=True):
         t = (text or '').strip().lower()
-        # The card's Apply request forbids hardware edits, not all parameter edits.
         t = re.sub(r'аппаратные параметры не меняй[.!;]?', '', t)
+        
+        # 1. Жесткая защита от случайных срабатываний на приветствия
+        if re.search(r'^(привет|здравствуй|добрый\s*(день|вечер|утро)|hello|hi)', t):
+            return 'question'
+            
+        # 2. Режим только чтения
         readonly = re.search(r'не\s+(?:меня\w*|изменя\w*|применя\w*|трогай)|ничего\s+не|только\s+(?:оцени\w*|покажи\w*|объясни\w*|сравни\w*)', t)
         diagnostic = re.search(r'провер\w*\s+(?:геометр\w*|сетк\w*|модел\w*|g-?code|траектор\w*)', t)
+        
         if readonly:
             return 'diagnostic' if diagnostic else 'question'
-        no_slice = re.search(r'без\s+нарез\w*|не\s+(?:нарез\w*|режь|запуска\w*\s+нарез\w*)', t)
         if diagnostic:
             return 'diagnostic'
-        action = re.search(r'\b(?:загрузи\w*|открой|положи\w*|поверни\w*|размести\w*|расставь\w*|ориентируй\w*|нарежь|нарезать|подготов\w*|настрой(?:те)?|примени\w*|выстави\w*|установи\w*|поставь\w*|поменяй\w*|смени\w*|включи\w*|выключи\w*|подбери\w*|выбери\w*|запусти\w*)\b', t)
-        if re.match(r'^(?:покажи|оцени|сравни|расскажи|объясни|почему|зачем|что|какой|какие|как)\b', t) and not action:
-            return 'question'
-        if task_text or re.search(r'\bтз\b|техническ\w*\s+задан\w*|условия\s+эксплуатации',t):
+            
+        no_slice = re.search(r'без\s+нарез\w*|не\s+(?:нарез\w*|режь|запуска\w*\s+нарез\w*)', t)
+        
+        if task_text or re.search(r'\bтз\b|техническ\w*\s+задан\w*|условия\s+эксплуатации', t):
             return 'settings_only' if no_slice else 'full_slice_task'
+            
+        # 3. Полный цикл (настройки + нарезка)
+        full = re.search(r'нарежь|нарезать|подготов\w*|настрой(?:те)?.*(?:модель|деталь|печать)|запусти\w*.*нарез', t)
+        if full and not no_slice:
+            return 'full_slice_task'
+            
+        # 4. Обычные вопросы
+        is_question = re.match(r'^(?:покажи|оцени|сравни|расскажи|объясни|почему|зачем|что|какой|какие|как)\b', t)
+        if is_question:
+            return 'question'
+            
+        # 5. Изменение настроек БЕЗ нарезки
+        action = re.search(r'\b(?:загрузи\w*|открой|положи\w*|поверни\w*|размести\w*|расставь\w*|ориентируй\w*|примени\w*|выстави\w*|установи\w*|поставь\w*|поменяй\w*|смени\w*|измени\w*|включи\w*|выключи\w*|подбери\w*|выбери\w*)\b', t)
         if action:
-            full = re.search(r'нарежь|нарезать|подготов\w*|настрой(?:те)?.*(?:модель|деталь|печать)|запусти\w*.*нарез',t)
-            return 'full_slice_task' if full and not no_slice else 'settings_only'
+            return 'settings_only'
+            
+        # По умолчанию - абсолютно безопасный режим диалога
         return 'question'
 
     def _run_slicing_and_wait(self, cancel, deadline, notify):

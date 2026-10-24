@@ -289,7 +289,8 @@ class Handler(SimpleHTTPRequestHandler):
             field_name = part.get_param("name", header="content-disposition")
             filename = part.get_filename()
             if field_name == "text" and filename is None:
-                text = part.get_content()
+                raw_bytes = part.get_payload(decode=True)
+                text = raw_bytes.decode('utf-8') if raw_bytes else ""
                 continue
             if field_name != "attachments" or filename is None:
                 raise ValueError("Неизвестное поле формы.")
