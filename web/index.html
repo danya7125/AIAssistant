@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>AI Assistant — STE Slicer</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=20261024-profile-inline">
 </head>
 <body>
     <div class="app-shell">
@@ -30,10 +30,103 @@
                 </div>
 
                 <div id="messages" class="messages" role="log" aria-live="polite" aria-relevant="additions">
-                    <div class="welcome-card" id="welcome">
-                        <h2>Здравствуйте!</h2>
-                        <p>Задайте вопрос по STE Slicer или расскажите, с чем помочь.</p>
-                    </div>
+                    <template id="profile-card-template">
+                        <article class="slice-profile" aria-labelledby="profile-title">
+                            <header class="profile-header">
+                                <span class="profile-eyebrow">ТЕКУЩИЙ ПРОФИЛЬ СЛАЙСЕРА</span>
+                                <h2 id="profile-title" data-profile-title>Активные настройки</h2>
+                            </header>
+
+                            <div class="profile-content">
+                                <section class="profile-preview" aria-labelledby="model-title">
+                                    <figure class="model-stage">
+                                        <div class="model-wheel" aria-hidden="true">
+                                            <span class="wheel-layer wheel-layer-back"></span>
+                                            <span class="wheel-layer wheel-layer-front"></span>
+                                            <span class="wheel-hub"></span>
+                                        </div>
+                                    </figure>
+                                    <div class="model-description">
+                                        <h3 id="model-title" data-model-name>Модель не загружена</h3>
+                                        <p data-model-size>Размеры появятся после загрузки модели</p>
+                                    </div>
+                                    <p class="rotate-hint">
+                                        <svg viewBox="0 0 20 20" aria-hidden="true">
+                                            <path d="M6 3.5v8.2l-1.7-1.4a1.2 1.2 0 0 0-1.7 1.7l4.1 4.1c.5.5 1.1.8 1.8.8h4.1a3 3 0 0 0 3-3V9.6a1.3 1.3 0 0 0-2.6 0v1.1-2a1.3 1.3 0 0 0-2.6 0V7.5a1.3 1.3 0 0 0-2.6 0v-4a1.3 1.3 0 0 0-2.6 0Z"></path>
+                                        </svg>
+                                        Наведите, чтобы вращать
+                                    </p>
+                                </section>
+
+                                <section class="profile-settings" aria-label="Параметры профиля, только для чтения">
+                                    <section class="parameter-group" aria-labelledby="material-heading">
+                                        <h3 id="material-heading">Материал</h3>
+                                        <dl class="parameter-list">
+                                            <div class="parameter-row">
+                                                <dt>Материал</dt>
+                                                <dd data-profile-material>—</dd>
+                                            </div>
+                                        </dl>
+                                    </section>
+                                    <section class="parameter-group" aria-labelledby="print-heading">
+                                        <h3 id="print-heading">Печать</h3>
+                                        <dl class="parameter-list">
+                                            <div class="parameter-row">
+                                                <dt>Сопло</dt>
+                                                <dd data-setting="machine_nozzle_size" data-unit=" мм">—</dd>
+                                            </div>
+                                            <div class="parameter-row">
+                                                <dt>Температура сопла</dt>
+                                                <dd data-setting="material_print_temperature" data-unit="°C">—</dd>
+                                            </div>
+                                            <div class="parameter-row">
+                                                <dt>Температура стола</dt>
+                                                <dd data-setting="material_bed_temperature" data-unit="°C">—</dd>
+                                            </div>
+                                            <div class="parameter-row">
+                                                <dt>Высота слоя</dt>
+                                                <dd data-setting="layer_height" data-unit=" мм">—</dd>
+                                            </div>
+                                        </dl>
+                                    </section>
+                                    <section class="parameter-group" aria-labelledby="speed-heading">
+                                        <h3 id="speed-heading">Скорости</h3>
+                                        <dl class="parameter-list">
+                                            <div class="parameter-row">
+                                                <dt>Печать</dt>
+                                                <dd data-setting="speed_print" data-unit=" мм/с">—</dd>
+                                            </div>
+                                            <div class="parameter-row">
+                                                <dt>Внешняя стенка</dt>
+                                                <dd data-setting="speed_wall" data-unit=" мм/с">—</dd>
+                                            </div>
+                                            <div class="parameter-row">
+                                                <dt>Первый слой</dt>
+                                                <dd data-setting="speed_layer_0" data-unit=" мм/с">—</dd>
+                                            </div>
+                                        </dl>
+                                    </section>
+                                    <section class="parameter-group" aria-labelledby="infill-heading">
+                                        <h3 id="infill-heading">Заполнение</h3>
+                                        <dl class="parameter-list">
+                                            <div class="parameter-row">
+                                                <dt>Заполнение</dt>
+                                                <dd data-setting="infill_sparse_density" data-unit="%">—</dd>
+                                            </div>
+                                        </dl>
+                                    </section>
+                                </section>
+                            </div>
+
+                            <footer class="profile-footer">
+                                <p class="profile-warning">
+                                    <span class="warning-mark" aria-hidden="true">!</span>
+                                    Предварительный профиль: требует калибровки перед печатью.
+                                </p>
+                                <button class="apply-profile-button" type="button">Применить</button>
+                            </footer>
+                        </article>
+                    </template>
                 </div>
 
                 <p id="status" class="status-text" role="status">Готов к работе</p>
@@ -47,7 +140,7 @@
                     ></textarea>
                     <div class="composer-footer">
                         <div class="composer-tools">
-                            <label class="attach-button" for="attachments" title="Прикрепить JPG, PNG, STL, OBJ или 3MF">
+                            <label class="attach-button" for="attachments" title="Прикрепить STL">
                                 <span aria-hidden="true">＋</span>
                                 <span>Прикрепить файл</span>
                             </label>
@@ -55,9 +148,9 @@
                                 id="attachments"
                                 class="visually-hidden"
                                 type="file"
-                                accept=".jpg,.jpeg,.png,.stl,.obj,.3mf"
+                                accept=".stl"
                                 multiple
-                                aria-label="Выбрать изображения или 3D-модели"
+                                aria-label="Выбрать STL-модель"
                             >
                             <span class="keyboard-hint">Enter — отправить · Shift+Enter — перенос строки</span>
                         </div>
@@ -121,6 +214,6 @@
             </aside>
         </main>
     </div>
-    <script src="script.js"></script>
+    <script src="script.js?v=20261024-profile-inline"></script>
 </body>
 </html>

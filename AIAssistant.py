@@ -215,6 +215,11 @@ class AIAssistant(Extension):
         with self._web_event_lock:
             return self._web_event_id
 
+    def get_web_profile(self):
+        return self._settings_tools.on_main_thread(
+            self._settings_tools.profile_snapshot
+        )
+
     def get_web_events(self, since):
         with self._web_event_lock:
             events = [
@@ -233,7 +238,7 @@ class AIAssistant(Extension):
             if len(self._web_events) > 500:
                 del self._web_events[:-500]
 
-    def ask_from_web(self, text):
+    def ask_from_web(self, text, attachments=None):
         if not self._web_request_lock.acquire(False):
             raise RuntimeError("Веб-чат уже обрабатывает сообщение.")
 
@@ -245,15 +250,33 @@ class AIAssistant(Extension):
             settings = self._settings_tools.on_main_thread(
                 self.get_print_settings
             )
+            request_text = text
+            history_text = text
+            if attachments:
+                attachment_lines = [
+                    "- {0}: {1}".format(item["name"], item["path"])
+                    for item in attachments
+                ]
+                request_text += (
+                    "\n\nВложения, временно сохранённые локально для этого запроса:\n"
+                    + "\n".join(attachment_lines)
+                    + "\nИспользуй путь только если пользователь явно попросил загрузить "
+                    "или открыть соответствующую модель. Не загружай её в сцену сам."
+                )
+                history_text += (
+                    "\nПрикреплены модели: "
+                    + ", ".join(item["name"] for item in attachments)
+                )
             return self.ask_llm(
-                text,
-                print_settings=settings
+                request_text,
+                print_settings=settings,
+                history_text=history_text
             )
         finally:
             self._web_request_lock.release()
 
     # Отправка запроса к нейросети
-    def ask_llm(self, text, print_settings=None, progress=None, cancel_event=None, task_text=None):
+    def ask_llm(self, text, print_settings=None, progress=None, cancel_event=None, task_text=None, history_text=None):
         config = self._config.copy()
         if not all(config.values()):
             return "Откройте AI Assistant → Settings и заполните URL, ключ и модель."
@@ -278,7 +301,7 @@ class AIAssistant(Extension):
                 print_settings=print_settings, progress=report_progress, cancel_event=cancel_event, task_text=task_text
             )
             self._history.extend([
-                {"role": "user", "content": text},
+                {"role": "user", "content": history_text if history_text is not None else text},
                 {"role": "assistant", "content": reply}
             ])
             self._history = self._history[-20:]

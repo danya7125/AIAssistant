@@ -304,6 +304,30 @@ class SettingsTools:
 
         return result
 
+    def profile_snapshot(self):
+        global_stack, _ = self._stacks()
+        profile_keys = (
+            "machine_nozzle_size",
+            "material_print_temperature",
+            "material_bed_temperature",
+            "layer_height",
+            "speed_print",
+            "speed_wall",
+            "speed_layer_0",
+            "infill_sparse_density",
+            "wall_line_count",
+            "printing_mode"
+        )
+        available = global_stack.getAllKeys()
+        settings = self.read([
+            key for key in profile_keys
+            if key in available
+        ])
+        return {
+            "context": self.get_print_context(),
+            "settings": settings
+        }
+
     def describe(self, query="", offset=0, limit=30):
         if not isinstance(query, str):
             raise ValueError("query должен быть строкой.")
@@ -882,4 +906,3 @@ class SettingsTools:
     def auto_export(self):
         from .AutoExport import auto_export_project_and_gcode
         return auto_export_project_and_gcode()
-
