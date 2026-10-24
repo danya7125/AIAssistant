@@ -160,6 +160,8 @@ class SceneTools:
         n = self.node(model_id)
         if axis not in ('x','y','z') or isinstance(degrees,bool) or not isinstance(degrees,(int,float)) or not math.isfinite(degrees) or abs(degrees)>360:
             raise ValueError('Ось x/y/z, угол от -360 до 360 градусов.')
+        if abs(degrees) < 1e-4 or abs(abs(degrees) - 360) < 1e-4:
+            return {'changes': [], 'scene': self.get_scene_models(), 'note': 'Модель сохранена в исходной ориентации (0°).'}
         vector = {'x':Vector(1,0,0),'y':Vector(0,1,0),'z':Vector(0,0,1)}[axis]
         volume, low, high = self.build_bounds()
         original = self.points(n)
