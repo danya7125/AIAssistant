@@ -41,6 +41,20 @@ def auto_export_project_and_gcode():
     if not isinstance(gcode_dict, dict) or plate not in gcode_dict or not gcode_dict[plate]:
         return {'ok': False, 'error': 'G-code не сформирован для активного стола.'}
         
+    # Чтение текущих настроек для записи в G-code
+    global_stack = app.getGlobalContainerStack()
+    extruder_stack = app.getExtruderManager().getActiveExtruderStack()
+    active_stack = extruder_stack if extruder_stack else global_stack
+
+    def get_setting(key):
+        if active_stack:
+            val = active_stack.getProperty(key, 'value')
+            return str(val) if val is not None else "Авто"
+        return "Неизвестно"
+        
+    material_name = getattr(active_stack, 'material', None)
+    material_str = material_name.getName() if material_name else "Не определен"
+    
     # Get active models and determine project/model name
     sliceable_nodes = [
         n for n in root.getAllChildren()
@@ -73,6 +87,25 @@ def auto_export_project_and_gcode():
     gcode_path = os.path.join(target_dir, "{0}.gcode".format(model_name))
     try:
         with open(gcode_path, "wt", encoding="utf-8") as stream:
+            # Записываем информационный заголовок от ИИ с параметрами печати
+            stream.write("; ==================================================================\n")
+            stream.write("; Сгенерировано при участии AI Assistant STE Slicer\n")
+            stream.write("; Проект: {0}\n".format(model_name))
+            stream.write("; \n")
+            stream.write("; ПАРАМЕТРЫ ПЕЧАТИ:\n")
+            stream.write("; Материал: {0}\n".format(material_str))
+            stream.write("; Высота слоя: {0} мм\n".format(get_setting('layer_height')))
+            stream.write("; Плотность заполнения: {0}%\n".format(get_setting('infill_sparse_density')))
+            stream.write("; Температура сопла: {0} °C\n".format(get_setting('material_print_temperature')))
+            stream.write("; Температура стола: {0} °C\n".format(get_setting('material_bed_temperature')))
+            stream.write("; Скорость печати: {0} мм/с\n".format(get_setting('speed_print')))
+            stream.write("; \n")
+            stream.write("; ИНФОРМАЦИЯ ДЛЯ ПОЛЬЗОВАТЕЛЯ:\n")
+            stream.write("; Этот файл содержит скомпилированные инструкции для 3D/5D-принтера.\n")
+            stream.write("; Он отвечает за координаты перемещения печатающей головки,\n")
+            stream.write("; подачу материала и жестко фиксирует температуры.\n")
+            stream.write("; ==================================================================\n\n")
+
             gcode_data = gcode_dict[plate]
             if isinstance(gcode_data, str):
                 stream.write(gcode_data)
