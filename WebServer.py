@@ -4,11 +4,14 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, unquote, urlsplit
 
+
 plugin_web = os.path.abspath(os.path.join(os.path.dirname(__file__), "web"))
 if os.path.isdir(plugin_web):
     WEB_DIR = plugin_web
 else:
-    WEB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, "web"))
+    WEB_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.pardir, "web")
+    )
 
 
 class ChatServer(ThreadingMixIn, HTTPServer):
@@ -26,6 +29,8 @@ class Handler(SimpleHTTPRequestHandler):
             and "\\" not in part
             and ":" not in part
         ]
+        if not parts:
+            return os.path.join(WEB_DIR, "index.html")
         return os.path.join(WEB_DIR, *parts)
 
     def end_headers(self):
@@ -73,6 +78,7 @@ class Handler(SimpleHTTPRequestHandler):
             events, cursor = assistant.get_web_events(since)
             self.send_json(200, {"events": events, "next_id": cursor})
             return
+
 
         if path == "/api/open-folder":
             try:
