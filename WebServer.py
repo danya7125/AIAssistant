@@ -41,8 +41,8 @@ def dispatch_setting(settings_tools, arguments, cancel_event=None, deadline=None
     key, value = arguments['key'], arguments['value']
     if not isinstance(key, str) or not key or len(key) > 200:
         raise ValueError('key должен быть настоящим именем параметра слайсера.')
-    if key == 'printing_mode' or key.startswith('machine_'):
-        raise ValueError('Режим печати и аппаратные параметры меняются только вручную.')
+    if key.startswith('machine_'):
+        raise ValueError('Аппаратные параметры меняются только вручную.')
     if key in ('material', 'material_id'):
         raise ValueError('Для выбора профиля материала используйте set_material(material_id=...).')
     if not isinstance(value, str) or len(value) > 1000:

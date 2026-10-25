@@ -137,8 +137,40 @@ def analyse(data, tensile_load_direction=None, critical_face_indices=None, cance
         v=vector(c)
         c['pareto_candidate']=c in eligible and not any(all(x<=y+1e-9 for x,y in zip(vector(b),v)) and any(x<y-1e-9 for x,y in zip(vector(b),v)) for b in eligible)
     candidates.sort(key=lambda c:(c['fits_build_box'] is False,not c['pareto_candidate'],-c['planar_contact_mm2'],c['height_mm']))
+
+    # BigTech Feature Detection: Автоматическое распознавание тонких рельефных пластин (Литофания / JPG / Барельеф)
+    cur_lo = f.min((0, 1))
+    cur_hi = f.max((0, 1))
+    cur_size = cur_hi - cur_lo
+    cur_dims = sorted(cur_size.tolist())
+    thickness, width, length = cur_dims[0], cur_dims[1], cur_dims[2]
+
+    m_name = str(data.get('name') or '').lower()
+    img_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff')
+    is_img_name = any(m_name.endswith(ext) or (ext + '.') in m_name for ext in img_exts)
+    is_keyword = any(kw in m_name for kw in ('литофан', 'lithophane', 'картин', 'барельеф', 'relief'))
+    is_flat_plate = bool(thickness <= 12.0 and width >= 20.0 and (width * length) / max(0.1, thickness * thickness) >= 8.0)
+    is_lithophane = bool(is_img_name or is_keyword or is_flat_plate)
+    is_lying_flat = bool(is_lithophane and abs(cur_size[1] - thickness) < 2.0)
+
+    if is_lithophane and is_lying_flat:
+        litho_candidates = [
+            c for c in candidates
+            if abs(c.get('degrees', 0)) in (90, 270) and c.get('height_mm', 0) >= width - 5.0
+        ]
+        if litho_candidates:
+            best_litho = max(litho_candidates, key=lambda c: (c.get('planar_contact_mm2', 0), c.get('height_mm', 0)))
+            best_litho['lithophane_recommended'] = True
+
     return {'model_id':data['model_id'],'candidate_count':len(candidates),'candidates':candidates,
-        'inputs':{'layer_height_mm':layer,'first_layer_height_mm':first,'support_angle_from_vertical_deg':angle,'contact_tolerance_mm':.02,'tensile_direction_source':'caller_supplied' if direction is not None else None,'critical_faces_source':'caller_supplied' if critical is not None else None},
+        'feature_detection': {
+            'is_thin_relief_or_lithophane': is_lithophane,
+            'is_image_file': is_img_name,
+            'model_name': data.get('name'),
+            'thickness_mm': round(float(thickness), 2),
+            'is_lying_flat': is_lying_flat
+        },
+        'inputs':{'layer_height_mm':layer,'first_layer_height_mm':first,'support_angle_from_vertical_deg':angle,'contact_tolerance_mm':.02,'printing_mode':data.get('printing_mode'),'tensile_direction_source':'caller_supplied' if direction is not None else None,'critical_faces_source':'caller_supplied' if critical is not None else None},
         'mesh_checks':{'closed_consistent_edges':closed,'single_connected_shell':connected,'shell_count':len(component_volumes),'shell_winding_consistent':consistent_shells,'normals_usable_for_overhang':trusted,'self_intersections_checked':False,'shell_intersections_or_nesting_checked':False},
         'method':{'support':'Sum of projected downward triangle prisms down to bed. Overlapping prisms and solid beneath are NOT subtracted. Geometric comparison proxy, not real support volume or material consumption; bridges and support algorithms not simulated.',
             'surface':'h*abs(normal_y) on inclined facets, area-weighted. Layer quantization proxy, NOT Ra/Rz, dimensional accuracy or tolerances. Horizontal/vertical ideal planes excluded.',

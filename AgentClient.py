@@ -123,19 +123,45 @@ class AgentClient:
                 if current is None and candidates:
                     current = candidates[0]
 
-                # 2. Выбираем до 3 лучших альтернативных Pareto-кандидатов с наибольшей площадью контакта
+                feature_det = report.get('feature_detection', {})
+                is_litho = bool(feature_det.get('is_thin_relief_or_lithophane') or feature_det.get('is_image_file'))
+                is_flat = bool(feature_det.get('is_lying_flat'))
+
+                # 2. Определение деталей, стоящих на тонком ребре / ободе (колеса, крыльчатки, диски, шестерни)
+                curr_contact = float(current.get('planar_contact_mm2') or 0) if current else 0.0
+                max_alt_contact = max([float(c.get('planar_contact_mm2') or 0) for c in candidates] or [0.0])
+                is_standing_on_edge = bool(max_alt_contact > 200.0 and curr_contact < 0.20 * max_alt_contact and curr_contact < 350.0)
+
+                if is_standing_on_edge:
+                    best_flat_cand = max(candidates, key=lambda c: float(c.get('planar_contact_mm2') or 0))
+                    best_flat_cand['edge_standing_fix_recommended'] = True
+
+                # Выбираем до 3 лучших альтернативных кандидатов
                 pareto_alts = [
                     c for c in candidates
-                    if c.get('pareto_candidate') and c.get('degrees') != 0
+                    if (c.get('pareto_candidate') or c.get('lithophane_recommended') or c.get('edge_standing_fix_recommended')) and c.get('degrees') != 0
                 ]
-                pareto_alts.sort(key=lambda c: (
-                    -(c.get('planar_contact_mm2') or 0),
-                    c.get('height_mm') or 9999
-                ))
+                if is_litho and is_flat:
+                    pareto_alts.sort(key=lambda c: (
+                        not c.get('lithophane_recommended'),
+                        -(c.get('planar_contact_mm2') or 0),
+                        c.get('height_mm') or 9999
+                    ))
+                elif is_standing_on_edge:
+                    pareto_alts.sort(key=lambda c: (
+                        not c.get('edge_standing_fix_recommended'),
+                        -(c.get('planar_contact_mm2') or 0),
+                        c.get('height_mm') or 9999
+                    ))
+                else:
+                    pareto_alts.sort(key=lambda c: (
+                        -(c.get('planar_contact_mm2') or 0),
+                        c.get('height_mm') or 9999
+                    ))
                 top_alts = pareto_alts[:3]
 
                 def _trim_cand(c, is_curr=False):
-                    return {
+                    cd = {
                         'axis': c.get('axis', 'x'),
                         'degrees': c.get('degrees', 0),
                         'height_mm': round(float(c.get('height_mm') or 0), 1),
@@ -143,6 +169,11 @@ class AgentClient:
                         'support_proxy_mm3': round(float(c.get('support_to_plate_prism_sum_mm3') or 0), 1),
                         'is_current': is_curr
                     }
+                    if c.get('lithophane_recommended'):
+                        cd['lithophane_recommended'] = True
+                    if c.get('edge_standing_fix_recommended'):
+                        cd['edge_standing_fix_recommended'] = True
+                    return cd
 
                 compact_candidates = []
                 if current is not None:
@@ -150,11 +181,28 @@ class AgentClient:
                 for c in top_alts:
                     compact_candidates.append(_trim_cand(c, is_curr=False))
 
+                mode_in = report.get('inputs', {}).get('printing_mode') or ''
+                if is_standing_on_edge:
+                    note_text = (
+                        'КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ: Деталь импортирована СТОЯ НА ТОНКОМ ОБОДЕ/РЕБРЕ! '
+                        'Площадь контакта при 0° ничтожно мала ({0} мм² против {1} мм² при укладке плашмя). '
+                        'Деталь оторвется от стола при печати, а при вращении 2900 об/мин её разорвет по слоям Z! '
+                        'СТРОГО НЕОБХОДИМ ПОВОРОТ НА 90° (orient_model по кандидату с edge_standing_fix_recommended=True), '
+                        'чтобы деталь легла плашмя на торец ступицы, а слои сформировали прочные кольца в плоскости XY!'
+                    ).format(round(curr_contact, 1), round(max_alt_contact, 1))
+                elif is_litho and is_flat:
+                    note_text = 'ВНИМАНИЕ: Геометрический сканер определил деталь как КАРТИНУ / ЛИТОФАНИЮ (рельефная пластина из JPG/PNG). КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать эластомеры (TPU) или 0% заполнения! ЗОЛОТОЙ ПРОФИЛЬ ДЛЯ КАРТИН: 1) Режим: classic (3D на плоском столе). 2) Ориентация: поворот на 90° вертикально на ребро (кандидат с lithophane_recommended=True) для передачи полутонов тонкими слоями 0.12 мм. 3) Материал: Proto PLA (Белый). 4) Заполнение: 100% (монолит без пустот во избежание просвечивания сетки). 5) Стенки: 8. 6) Кайма: Brim 12 мм (обязательна для удержания тонкой вертикальной пластины). 7) Поддержки: False, обдув: 100%.'
+                elif mode_in in ('cylindrical', 'cylindrical_full'):
+                    note_text = 'ВНИМАНИЕ: Активен режим 5D-печати Stereotech (на вращающейся оправке). Если деталь соосна оправке, поворот не требуется (Закон 0°). Режим 5D сохраняется для нарезки.'
+                else:
+                    note_text = 'Показано текущее положение (0°) и лучшие альтернативы по устойчивости. Если текущее положение обеспечивает достаточную площадь контакта и правильную укладку слоев вдоль изгибающих нагрузок, поворот не требуется (Закон 0°).'
+
                 compact_report = {
                     'model_id': report.get('model_id'),
+                    'detected_feature': 'lithophane_or_thin_relief' if (is_litho and is_flat) else 'standard_mesh',
                     'current_orientation': compact_candidates[0] if compact_candidates else None,
                     'top_candidates': compact_candidates,
-                    'note': 'Показано текущее положение (0°) и лучшие альтернативы по устойчивости. Если текущее положение обеспечивает достаточную площадь контакта и правильную укладку слоев вдоль изгибающих нагрузок, поворот не требуется (Закон 0°).'
+                    'note': note_text
                 }
                 obj['result'] = compact_report
                 msg['content'] = json.dumps(obj, ensure_ascii=False, allow_nan=False)
@@ -391,13 +439,50 @@ class AgentClient:
             '''Ты ведущий инженер-технолог аддитивного производства и эксперт STE Slicer.
 Твоя цель — безупречная инженерная подготовка 3D-моделей к печати: правильная ориентация с учетом анизотропии FDM, безошибочный подбор материала Stereotech и технологических параметров.
 
+=== ПРИОРИТЕТ 0: КАРТИНЫ, ЛИТОФАНИИ И ФОТО-БАРЕЛЬЕФЫ (ИЗ JPG/PNG ИЛИ ТОНКИЕ РЕЛЬЕФНЫЕ ПЛАСТИНЫ) ===
+ФИЗИЧЕСКАЯ ГЕОМЕТРИЯ ПЛАСТИНЫ ИМЕЕТ АБСОЛЮТНЫЙ ПРИОРИТЕТ НАД НАЗВАНИЕМ ДЕТАЛИ!
+Если в get_scene_models имя файла заканчивается на графическое расширение (.jpg, .jpeg, .png, .bmp, .webp, .tif)
+ЛИБО если analyse_orientation вернул detected_feature = "lithophane_or_thin_relief":
+Перед тобой КАРТИНА (литофания), а НЕ техническая деталь! Даже если файл назван «пыльник», «вал», «колесо», «шестерня» — это барельеф из картинки, к которому КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО применять TPU (эластомеры), композиты или 0% заполнения!
+
+ЗОЛОТОЙ ИНЖЕНЕРНЫЙ СТАНДАРТ ДЛЯ ЛЮБОЙ КАРТИНЫ:
+1. РЕЖИМ ПЕЧАТИ: УВАЖАЙ ВЫБОР ПОЛЬЗОВАТЕЛЯ! Если пользователь в слайсере выбрал 5D — сохраняй 5D (cylindrical/cylindrical_full), НЕ ПЕРЕКЛЮЧАЙ в classic! Если выбран classic — печатай на плоском столе в 3D.
+2. МАТЕРИАЛ: set_material("proto_pla", ...). Исключительно белый жесткий Proto PLA. Он обладает идеальной оптической полупрозрачностью для проявления полутонов на просвет. Эластомеры и черные/темные пластики разрушают оптический эффект!
+3. ОРИЕНТАЦИЯ: orient_model с поворотом на 90° вертикально на ребро (выбрать кандидат с lithophane_recommended=True).
+   - ПОЧЕМУ: При печати плашмя высота пластины всего 2-4 мм (это 15-30 слоев) — фото превратится в грубые ступени с потерей полутонов. При повороте на 90° вертикально ось Z делает тысячи микрошагов по 0.12 мм, передавая фотографическую детализацию!
+4. ПАРАМЕТРЫ ПЕЧАТИ (set_print_settings):
+   - infill_sparse_density: 100.0 (СТРОГО монолит без внутренних пустот и решеток, иначе подсветка покажет ребра заполнения!).
+   - wall_line_count: 8 (монолитная укладка контура).
+   - layer_height: 0.12 (первый слой layer_height_0: 0.20) для тончайшего разрешения.
+   - adhesion_type: "brim", brim_width: 12.0 (широкая кайма обязательна: узкая высокая пластина без каймы упадет при печати!).
+   - support_enable: False (поддержки не требуются и испортят барельеф).
+   - cool_fan_enabled: True, cool_fan_speed: 100.0.
+   - speed_print: 30.0 (умеренная скорость для жесткости высокой детали).
+   - outer_inset_first: True.
+
+=== ПРАВИЛА 5D-ПЕЧАТИ (STEREOTECH 5D HYBRID / CYLINDRICAL) ===
+Если в контексте слайсера printing_mode равен "cylindrical" или "cylindrical_full" (или пользователь выбрал 5D):
+1. СОХРАНЕНИЕ 5D: СТРОЖАЙШЕ ЗАПРЕЩЕНО менять или сбрасывать printing_mode на "classic"! Режим 5D ОБЯЗАН оставаться активным!
+2. ОРИЕНТАЦИЯ В 5D: Если деталь уже соосна оправке — поворот не требуется (0°). НО ЕСЛИ круглая деталь (колесо, шкив, шестерня) импортирована стоя на ребре/ободе, её ОБЯЗАТЕЛЬНО нужно повернуть на 90° (orient_model по кандидату с edge_standing_fix_recommended=True), чтобы положить плашмя на торец ступицы!
+3. ПАРАМЕТРЫ 5D (set_print_settings):
+   - cylindrical_mode_base_diameter: диаметр оправки станка (например 6, 8, 10, 12, 16 мм). Всегда должен быть > 0.
+   - infill_sparse_density: 70..100% (для прочных втулок, валов и непрерывной укладки слоев вокруг оси).
+   - wall_line_count: 4..8 (прочный силовой контур вокруг оправки).
+   - adhesion_type: "skirt" (в 5D кайма brim на стол не применяется).
+4. МАТЕРИАЛЫ 5D: Конструкционные полимеры Stereotech под нагрузки вращения и скручивания: Fiberpart PC G20 (жесткость и термостойкость), Ultrax / PA6-CF (сверхпрочность с углеволокном), Enduse PA6 (для трения скольжения).
+
 === ТРИ ФИЗИЧЕСКИХ ЗАКОНА FDM И ОРИЕНТАЦИИ ===
 1. ЗАКОН АНИЗОТРОПИИ FDM:
    Межслойная прочность (по оси Z) составляет лишь 40-60% от прочности монолитной нити в плоскости XY. При изгибе и растяжении деталь ВСЕГДА разрушается по границе слоев. Поэтому растягивающие и изгибающие напряжения ОБЯЗАНЫ лежать строго в плоскости XY!
-2. ЗАКОН НУЛЕВОГО ПОВОРОТА (0° CAD-БАЗА):
-   Всегда оценивай исходное положение модели (0°)! Инженеры-конструкторы в 85% случаев экспортируют STL уже в рабочей ориентации.
-   ЕСЛИ модель УЖЕ лежит на широкой плоскости, вал УЖЕ лежит горизонтально, шестерня УЖЕ лежит плашмя на торце, а пыльник УЖЕ стоит вертикально на фланце — ВЫЗЫВАТЬ orient_model СТРОЖАЙШЕ ЗАПРЕЩЕНО! Оставляй 0°!
-   Вызов orient_model разрешен ТОЛЬКО если деталь импортирована «стоя на тонком ребре» или вал стоит торчком по Z и гарантированно сломается.
+2. ЗАКОН НУЛЕВОГО ПОВОРОТА И ОБЯЗАТЕЛЬНЫЕ ИСКЛЮЧЕНИЯ:
+   Всегда оценивай исходную ориентацию и площадь контакта при 0°:
+   - ЕСЛИ модель УЖЕ лежит на широкой плоскости, вал УЖЕ лежит горизонтально, а шестерня УЖЕ лежит плашмя — поворот НЕ планируй (0°).
+   - КРИТИЧЕСКОЕ ИСКЛЮЧЕНИЕ (Колеса, крыльчатки, диски, шестерни, шкивы):
+     Если круглая деталь вращения импортирована СТОЯ НА ОБОДЕ / РЕБРЕ (как колесо велосипеда на дороге) — ВЫЗОВ orient_model НА 90° ПЛАШМЯ НА ТОРЕЦ СТУПИЦЫ СТРОЖАЙШЕ ОБЯЗАТЕЛЕН!
+     ФИЗИЧЕСКОЕ ОБОСНОВАНИЕ:
+     1) Площадь опоры на ободе равна ~0 — деталь не удержится на столе и упадет при печати.
+     2) Центробежные силы на 2900 об/мин и крутящий момент шпонки действуют радиально: колесо расколется поперек слоев Z.
+     3) При повороте на 90° плашмя на торец ступицы слои укладываются сплошными неразрывными кольцами в плоскости XY — максимальная прочность на разрыв и срез!
 3. ЗАКОН ТРИБОЛОГИЧЕСКОЙ СОВМЕСТИМОСТИ (ТРЕНИЕ СКОЛЬЖЕНИЯ):
    Композиты с рубленым волокном (Fiberpart GF/CF) на микроуровне работают как наждачная бумага! Их КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ставить в пары сухого трения с мягкими полимерами (POM/полиацеталь, фторопласт) или цветными металлами (бронза, латунь, алюминий) — волокно сточит ответную деталь за смену. В пары скольжения ставить ИСКЛЮЧИТЕЛЬНО ненаполненный антифрикционный нейлон Enduse PA6!
 
@@ -430,6 +515,13 @@ class AgentClient:
 3. Запусти нарезку: start_slicing().
 
 === ЭТАЛОННЫЕ ПРИМЕРЫ РЕШЕНИЯ ЗАДАЧ (FEW-SHOT GOLDEN CASES) ===
+Кейс 0 (Картина / Литофания из JPG/PNG):
+• ТЗ: Любая картина / фотография / литофания, например "Портрет.jpg", "Пыльник шруса.jpg" или "Ось вращения.jpg".
+• Анализ: Геометрия — тонкая пластина с барельефом. Печать плашмя дает грубую ступеньку. Необходим вертикальный поворот на 90° на ребро.
+• Материал: Исключительно Proto PLA (Белый) для идеального светопропускания.
+• Параметры: wall_line_count=8, infill_sparse_density=100%, layer_height=0.12, adhesion_type="brim", brim_width=12.0, cool_fan_speed=100, support_enable=False, speed_print=30.0.
+• Действие на Этапе 1: Описать преимущества вертикальной печати (фотографическая детализация Z-слоями), предложить Proto PLA White и 100% монолит.
+
 Кейс 1 (Шестерня привода):
 • ТЗ: Нагруженная шестерня редуктора, момент 45 Н·м, влажность 80%.
 • Анализ: Зубья работают на циклический срез в плоскости вращения. Шестерня обязана лежать плашмя на торце (XY), чтобы контур зуба формировался сплошными периметрами. Исходное положение уже плашмя торцом на столе -> orient_model НЕ вызывать (0°)!
@@ -447,11 +539,26 @@ class AgentClient:
 • ТЗ: Защитный гофрированный чехол ШРУС, смазка MoS2, изгиб до 42°, дорожные реагенты.
 • Анализ: Сильфон должен сжиматься и изгибаться как пружина -> ставить вертикально на фланец. Исходное положение вертикально -> orient_model НЕ вызывать (0°)! Требуется эластичность >300% и стойкость к MoS2 -> Sealant TPU 93.
 • Параметры: wall_line_count=2, infill_sparse_density=0% (zero infill для сохранения гибкости гофры!).
-• Действие на Этапе 1: Выдать отчет и спросить подтверждение.'''
+• Действие на Этапе 1: Выдать отчет и спросить подтверждение.
+
+Кейс 4 (Ось вращения / Вал / Втулка в режиме 5D):
+• ТЗ: Ось вращения передающих звёзд, силовой вал или втулка на оправке 5D (диаметр основания 6 мм).
+• Анализ: Режим 5D (cylindrical_full). Деталь базируется на вращающейся оправке станка. Смещение на плоский стол запрещено -> orient_model НЕ вызывать (0°)! Режим 5D сохраняется без изменений!
+• Материал: Высокие динамические нагрузки кручения -> Fiberpart PC G20 или Ultrax (PA6-CF).
+• Параметры: printing_mode="cylindrical_full", cylindrical_mode_base_diameter=6, wall_line_count=6, infill_sparse_density=100%, adhesion_type="skirt", speed_print=30.0.
+• Действие на Этапе 1: Описать преимущества непрерывной 5D-укладки вокруг оправки, подтвердить параметры и запустить нарезку в 5D.
+
+Кейс 5 (Рабочее колесо центробежного насоса / Крыльчатка):
+• ТЗ: Рабочее колесо насоса, 2900 об/мин, напор 16 бар, щелочная среда pH 9.5..10.5, гликоль 85°C, шпонка 12 Н·м, запрет углеволокна (гальванопара с алюминием).
+• Анализ: Колесо импортировано стоя на круглом ободе -> КАТАСТРОФА! ОБЯЗАТЕЛЕН поворот на 90° плашмя на торец ступицы (orient_model по кандидату с edge_standing_fix_recommended=True)! Слои формируют концентрические кольца в плоскости XY против центробежных сил 2900 об/мин.
+• Материал: Fiberpart PP G30 (полипропилен со стекловолокном 30%). Идеальная щелочестойкость pH 1..14, водопоглощение <0.02%, модуль 5500 МПа, стекловолокно — диэлектрик (нет гальванопары в отличие от CF).
+• Параметры: wall_line_count=6, infill_sparse_density=100%, gyroid, speed_print=30.0, outer_inset_first=True.
+• Действие на Этапе 1: Обосновать поворот на 90° плашмя на торец ступицы, подтвердить Fiberpart PP G30 и 100% заполнение.'''
         )}]
         changes = []
         slicing = None
         seen = set()
+        is_picture_scene = False
         default_printer_id = None
         default_extruder_id = None
         has_models = True
@@ -668,13 +775,37 @@ class AgentClient:
                                 arguments['printer_id'] = default_printer_id
                             if not arguments.get('extruder_id') and default_extruder_id:
                                 arguments['extruder_id'] = default_extruder_id
+                            if is_picture_scene:
+                                mat_req = str(arguments.get('material_id', '')).lower()
+                                if any(bad in mat_req for bad in ('tpu', 'sealant', 'flex')):
+                                    arguments['material_id'] = 'proto_pla' 
 
                         if name == 'set_print_settings':
                             if 'values' not in arguments or not isinstance(arguments.get('values'), dict):
                                 raise ValueError('Передайте словарь настоящих ключей слайсера в поле "values".')
+                            s_vals = arguments['values']
+                            # Приоритет выбора пользователя: если в интерфейсе включен 5D, не даем перетереть его в 3D (classic)
+                            active_pm = None
+                            if isinstance(initial, dict) and isinstance(initial.get('settings'), dict):
+                                active_pm = initial['settings'].get('printing_mode')
+                            if active_pm in ('cylindrical', 'cylindrical_full'):
+                                if s_vals.get('printing_mode') == 'classic':
+                                    del s_vals['printing_mode']
 
-                            if 'printing_mode' in arguments['values']:
-                                raise ValueError('printing_mode меняется только вручную в интерфейсе.')
+                            if is_picture_scene:
+                                if active_pm not in ('cylindrical', 'cylindrical_full'):
+                                    # В классическом 3D для картин всегда монолит и кайма
+                                    if 'infill_sparse_density' in s_vals and float(s_vals['infill_sparse_density']) < 90.0:
+                                        s_vals['infill_sparse_density'] = 100.0
+                                    if s_vals.get('adhesion_type') in ('none', 'skirt'):
+                                        s_vals['adhesion_type'] = 'brim'
+                                        s_vals['brim_width'] = 12.0
+                                    if 'support_enable' in s_vals:
+                                        s_vals['support_enable'] = False
+                                    if 'wall_line_count' in s_vals and int(s_vals['wall_line_count']) < 6:
+                                        s_vals['wall_line_count'] = 8
+
+
 
                         fingerprint = name + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
                         if fingerprint in seen and name not in ('get_scene_models', 'analyse_orientation', 'validate_geometry'):
@@ -704,6 +835,17 @@ class AgentClient:
                         else:
                             output = self.tools.call(name, arguments, cancel_event=cancel, deadline=deadline)
                         seen.add(fingerprint)
+
+                        if name == 'get_scene_models' and isinstance(output, dict) and 'models' in output:
+                            for sm in output['models']:
+                                sm_name = str(sm.get('name') or '').lower()
+                                if any(sm_name.endswith(ext) or (ext + '.') in sm_name for ext in ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff')) or any(kw in sm_name for kw in ('литофан', 'lithophane', 'картин', 'барельеф')):
+                                    is_picture_scene = True
+
+                        if name == 'analyse_orientation' and isinstance(output, dict):
+                            s_feat = output.get('feature_detection', {})
+                            if s_feat.get('is_thin_relief_or_lithophane') or s_feat.get('is_image_file'):
+                                is_picture_scene = True
 
                         if name in ('load_model','orient_model','arrange_models'):
                             changes.extend(output.get('changes', []))

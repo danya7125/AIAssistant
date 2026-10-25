@@ -1,4 +1,4 @@
-﻿from .OrientationAnalysis import analyse as analyse_orientation_mesh
+from .OrientationAnalysis import analyse as analyse_orientation_mesh
 from .SceneTools import SceneTools
 from .GeometryChecks import snapshot_geometry, analyse_geometry, snapshot_gcode, analyse_gcode
 
@@ -562,6 +562,8 @@ class SettingsTools:
                     if key.startswith("cool_fan_") and not stack.getProperty("cool_fan_enabled", "value"):
                         continue
                     if key.startswith("retraction_") and not stack.getProperty("retraction_enable", "value"):
+                        continue
+                    if key.startswith("material_bed_temperature"):
                         continue
                     raise ValueError(key + ": неактивен или отклонён; весь пакет откатан.")
                 if "Error" in state or "Exception" in state:

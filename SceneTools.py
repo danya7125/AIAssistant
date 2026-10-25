@@ -35,11 +35,12 @@ class SceneTools:
         plate = app.getMultiBuildPlateModel().activeBuildPlate
         return [n for n in root.getAllChildren() if n.getMeshData() is not None
                 and n.callDecoration('isSliceable') and n.callDecoration('getBuildPlateNumber') == plate]
-    def points(self, node):
+    def points(self, node, max_points=100000):
         m = node.getWorldTransformation().getData()
         v = node.getMeshData().getVertices()
-        if len(v) > 1500000:
-            raise ValueError('Сетка слишком большая для анализа ориентации.')
+        if len(v) > max_points:
+            step = max(1, len(v) // max_points)
+            v = v[::step]
         return v.dot(m[:3,:3].T) + m[:3,3]
     def get_scene_models(self):
         models = []
@@ -54,10 +55,8 @@ class SceneTools:
             raise ValueError('Загрузка ещё идёт; повторите get_scene_models перед изменением или нарезкой.')
     def classic(self):
         self.ready()
-        if self.app().getGlobalContainerStack().getProperty('printing_mode','value') != 'classic':
-            raise ValueError('Поворот и расстановка доступны только в classic/3D. В 5D нужна отдельная проверка оси и основания.')
     def node(self, model_id):
-        self.classic()
+        self.ready()
         found = [n for n in self.nodes() if str(id(n)) == str(model_id)]
         if len(found) != 1:
             raise ValueError('Получите актуальный model_id через get_scene_models.')
@@ -109,17 +108,35 @@ class SceneTools:
         return {'status':'loading','path':path,'note':'Дождитесь completed через get_scene_models; это ещё не подтверждение загрузки.'}
     def orientation_snapshot(self, model_id):
         n = self.node(model_id)
-        v = self.points(n)
-        ix = n.getMeshData().getIndices()
-        faces = v.reshape((-1,3,3)) if ix is None else v[np.asarray(ix).reshape((-1,3))]
+        m = n.getWorldTransformation().getData()
+        mesh = n.getMeshData()
+        v = mesh.getVertices()
+        ix = mesh.getIndices()
+
+        # Корректное извлечение и прореживание треугольников для 3D и литофаний
+        if ix is not None:
+            indices = np.asarray(ix).reshape((-1, 3))
+            if len(indices) > 40000:
+                step = max(1, len(indices) // 40000)
+                indices = indices[::step]
+            v_world = v.dot(m[:3, :3].T) + m[:3, 3]
+            faces = v_world[indices]
+        else:
+            # Для неиндексированных сеток (STL) вершины идут строго тройками (треугольниками)
+            n_tri = len(v) // 3
+            v_tri = v[:n_tri * 3].reshape((n_tri, 3, 3))
+            if n_tri > 40000:
+                step = max(1, n_tri // 40000)
+                v_tri = v_tri[::step]
+            faces = v_tri.dot(m[:3, :3].T) + m[:3, 3]
         stack = self.app().getGlobalContainerStack()
         values = {}
         # Use the selected object's effective stack, including material/extruder overrides.
         effective = n.callDecoration('getStack') or stack
-        for key in ('layer_height','layer_height_0','support_angle'):
+        for key in ('layer_height','layer_height_0','support_angle','printing_mode'):
             values[key] = effective.getProperty(key,'value')
         _,lo,hi = self.build_bounds()
-        values.update({'faces':faces.copy(),'model_id':model_id,'build_size':(hi-lo).tolist()})
+        values.update({'faces':faces.copy(),'model_id':model_id,'name':n.getName(),'build_size':(hi-lo).tolist()})
         return values
     def build_bounds(self):
         volume = self.app().getBuildVolume()
@@ -179,7 +196,10 @@ class SceneTools:
             n.translate(Vector(*delta.tolist()),SceneNode.TransformSpace.World)
         return self.commit([n],edit)
     def arrange_models(self, margin_mm=10):
-        self.classic()
+        stack = self.app().getGlobalContainerStack()
+        if stack.getProperty('printing_mode', 'value') != 'classic':
+            return {'changes': [], 'scene': self.get_scene_models(), 'note': 'В режиме 5D (цилиндрическая печать) деталь базируется на вращающейся оправке, расстановка по плоскости стола не требуется.'}
+        self.ready()
         if isinstance(margin_mm,bool) or not isinstance(margin_mm,(int,float)) or not math.isfinite(margin_mm) or not 2<=margin_mm<=100:
             raise ValueError('margin_mm: от 2 до 100 мм.')
         nodes = self.nodes()
