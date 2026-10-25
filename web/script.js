@@ -18,7 +18,7 @@ const CLEAR_MARKER_KEY = 'ai-assistant-web-cleared-tail';
 const LOCAL_HISTORY_KEY = 'ai-assistant-local-history';
 const IS_SENDING_KEY = 'ai-assistant-is-sending';
 
-const REQUEST_TIMEOUT_MS = 200000;
+const REQUEST_TIMEOUT_MS = 600000;
 const MAX_ATTACHMENTS = 8;
 const ALLOWED_EXTENSIONS = ['stl'];
 let selectedFiles = [];
@@ -453,7 +453,7 @@ function extractCard(text) {
 
 function shouldShowProfileCard(text, requestText, hasProfileChanges) {
     return Boolean(hasProfileChanges) ||
-        /(?:профил|настройк\w*\s+(?:печати|слайсера)|параметр\w*\s+(?:печати|слайсера)|покажи.*(?:параметр|настройк|профил)|прикреплённ|прикреплены|\.stl)/i
+        /(?:профил|модел\w*|3d|3д|настройк\w*\s+(?:печати|слайсера)|параметр\w*\s+(?:печати|слайсера)|(?:покажи|выведи|отобрази|открой).*(?:модел|3d|3д|параметр|настройк|профил|карточк)|прикреплённ|прикреплены|\.stl)/i
             .test(requestText || '');
 }
 

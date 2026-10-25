@@ -601,6 +601,16 @@ class AgentClient:
                         reason = 'Подготовка не завершена: ' + ', '.join(sorted(pending_failures)) if pipeline_failed else None
                         return self._summary(changes, slicing, reason)
                     # LLM may propose a profile, but cannot attest that it was applied.
+                    show_model_intent = bool(re.search(
+                        r'(?:покажи|выведи|отобрази|открой|визуализируй|дай|где)\s*(?:мне\s*)?(?:3d|3д)?\s*(?:модел\w*|карточк\w*|детал\w*|профил\w*)',
+                        (text or '').lower()
+                    )) or bool(re.search(r'\b(?:3d|3д)\s*модел\w*', (text or '').lower()))
+                    if show_model_intent and has_models:
+                        try:
+                            return self._profile_card(reply or 'Текущая 3D-модель со стола SteSlicer:')
+                        except Exception:
+                            pass
+
                     from .ProfileCard import parse_card
                     card = parse_card(reply)
                     if card is not None:
